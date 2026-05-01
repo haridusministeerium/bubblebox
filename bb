@@ -301,23 +301,23 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 args.extend(("--dir", dest_path))
             elif (symlink := mount.get("symlink")) is not None:  # { symlink: string }
                 args.extend(("--symlink", symlink.format(**format_vars), dest_path))
-            elif (bind := mount.get("bind")) is not None:  # { bind: { path: string; readOnly?: boolean; dev?: boolean; try?: boolean, create?: boolean }}
+            elif (bind := mount.get("bind")) is not None:  # { bind: { path: string; ro?: boolean; dev?: boolean; try?: boolean, create?: boolean }}
                 prefix = "dev-" if bind.get("dev") else "ro-" if bind.get("ro") else ""
                 suffix = "-try" if bind.get("try") else ""
                 src_path = os.path.expanduser(bind.get("path", dest_path).format(**format_vars))
                 if bind.get("create"):
                     os.makedirs(src_path, exist_ok=True)
                 args.extend((f"--{prefix}bind{suffix}", src_path, dest_path))
-            elif (fd := mount.get("fd")) is not None:  # { fd: { fd: number; readOnly?: boolean }}
-                args.extend(("--ro-bind-fd" if fd.get("readOnly") else "--bind-fd", str(fd["fd"])))
+            elif (fd := mount.get("fd")) is not None:  # { fd: { fd: number; ro?: boolean }}
+                args.extend(("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"])))
             elif (file := mount.get("file")) is not None:  # { file: DataSource & { perms?: number }}
                 if (perms := file.get("perms")) is not None:
                     args.extend(("--perms", str(perms)))
                 args.extend(("--file", format_datasource_value(file), dest_path))
-            elif (data := mount.get("data")) is not None:  # { data: DataSource & { readOnly?: boolean; perms?: number }}
+            elif (data := mount.get("data")) is not None:  # { data: DataSource & { ro?: boolean; perms?: number }}
                 if (perms := data.get("perms")) is not None:
                     args.extend(("--perms", str(perms)))
-                args.extend(("--ro-bind-data" if data.get("readOnly") else "--bind-data", format_datasource_value(data), dest_path))
+                args.extend(("--ro-bind-data" if data.get("ro") else "--bind-data", format_datasource_value(data), dest_path))
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
                 for lower in overlay["lower"]:
                     args.extend(("--overlay-src", lower.format(**format_vars)))
