@@ -15,21 +15,33 @@ import pprint
 import re
 import shlex
 import sys
-
 import yaml
+
+LOGGER: logging.Logger = logging.getLogger()
 
 SANDBOXES_CACHE: dict[str, dict] = {}
 GLOBAL_SANDBOXES: list[dict] = []
 
-BWRAP_FLAGS: set[str] = {"levelPrefix", "unshareAll", "shareNet", "unshareUser", "unshareUserTry", "unshareIpc", "unsharePid", "unshareNet", "unshareUts", "unshareCgroup", "unshareCgroupTry", "disableUserns", "assertUsernsDisabled", "clearenv", "newSession", "dieWithParent", "asPid1"}
-BWRAP_OPTIONS: set[str] = {"argv0", "userns", "userns2", "pidns", "uid", "gid", "hostname", "chdir", "execLabel", "fileLabel", "seccomp", "syncFd", "blockFd", "usernsBlockFd", "infoFd", "jsonStatusFd"}
+BWRAP_FLAGS: set[str] = {"levelPrefix", "unshareAll", "shareNet", "unshareUser",
+                         "unshareUserTry", "unshareIpc", "unsharePid", "unshareNet",
+                         "unshareUts", "unshareCgroup", "unshareCgroupTry",
+                         "disableUserns", "assertUsernsDisabled", "clearenv",
+                         "newSession", "dieWithParent", "asPid1"}
+BWRAP_OPTIONS: set[str] = {"argv0", "userns", "userns2", "pidns", "uid", "gid",
+                           "hostname", "chdir", "execLabel", "fileLabel",
+                           "seccomp", "syncFd", "blockFd", "usernsBlockFd",
+                           "infoFd", "jsonStatusFd"}
+# bwrap options that may be defined multiple times:
 BWRAP_LIST_OPTIONS: set[str] = {"addSeccompFd", "capAdd", "capDrop", "lockFile", "remountRo"}
 
-MERGE_POLICY: dict[str, set[str]] = {
+MERGE_POLICIES: dict[str, set[str]] = {
   "items": {"mounts", "chmod"},
-  "literal": BWRAP_FLAGS.union(BWRAP_OPTIONS).union({"disableSandbox", "vars.*", "env.*", "dbus.sloppyNames.*", "dbus.sandbox.*", "dbus.user.*", "dbus.system.*"}),
+  # TODO: wouldn't "override" or "overwrite" be a better name than "literal"?
+  "literal": BWRAP_FLAGS.union(BWRAP_OPTIONS).union({"disableSandbox", "vars.*", "env.*", "dbus.sloppyNames.*",
+                                                     "dbus.sandbox.*", "dbus.user.*", "dbus.system.*"}),
   "list": BWRAP_LIST_OPTIONS.union({"extraArgs"}).union({"matches", "dbus.rules.*.*.*"}),
-  "dict": {"vars", "env", "dbus", "dbus.sloppyNames", "dbus.sandbox", "dbus.user", "dbus.system", "dbus.rules.*", "dbus.rules.*.*"},
+  "dict": {"vars", "env", "dbus", "dbus.sloppyNames", "dbus.sandbox",
+           "dbus.user", "dbus.system", "dbus.rules.*", "dbus.rules.*.*"},
   "discard": {"name", "include"},
 }
 
@@ -41,8 +53,8 @@ def tagged_append(tag: str, dest: list[tuple[str,str]]):
     return TaggedAppend
 
 
-def load_sandboxes_file(path: Path|str, default_name=None) -> list[dict]:
-    logging.debug("loading %s", path)
+def load_sandboxes_file(path: Path|str, default_name: str|None=None) -> list[dict]:
+    LOGGER.debug("loading %s", path)
     with open(path) as fd:
         sandboxes: list[dict] = list(yaml.safe_load_all(fd))
         for i, sb in enumerate(sandboxes):
@@ -75,7 +87,7 @@ def load_sandbox(name: str) -> dict:
 def get_merge_policy(path: list[str], k: str) -> tuple[str, list[str]]:
     kl = ".".join(path + [k])
     kg = ".".join(path + ["*"])
-    for p, s in MERGE_POLICY.items():
+    for p, s in MERGE_POLICIES.items():
         if kl in s:
             return p, path + [k]
         elif kg in s:
@@ -93,13 +105,19 @@ def merge(a: dict, b: dict, path: list[str]=[]) -> dict:
             case "items":
                 left = a.get(k, {})
                 right = b.get(k, {})
+                # TODO: is this merge correct? e.g. mounts' dict would get merged
+                #       into list of (k, v) tuples. think 'items' policy needs to
+                #       be removed, and (mounts, chmod) should be merged by 'literal'
                 res[k] = (list(left.items()) if isinstance(left, dict) else left) + \
                     (list(right.items()) if isinstance(right, dict) else right)
             case "dict":
                 res[k] = merge(a.get(k, {}), b.get(k, {}), key_path)
             case "literal":
                 res[k] = b.get(k, a.get(k))
-            # TODO: no need to handle "discard" case as its name implies, right?
+            case "discard":
+                pass
+            case _:
+                raise NotImplementedError
     return res
 
 
@@ -195,24 +213,29 @@ def get_sandbox(sb: dict) -> dict:
     return {**sb, "vars": vars, "env": env, "envUnset": env_unset, "mounts": mounts, "chmod": chmod}
 
 
-def pipefd(data: bytes):
+# returns read end of the pipe
+def pipefd(data: bytes) -> int:
     pr, pw  = os.pipe2(0)
     if os.fork() == 0:
         os.close(pr)
         os.write(pw, data)
-        sys.exit(0)
+        sys.exit(0)  # immediately exit the child process
     else:
         os.close(pw)
         return pr
 
 
+# resolve bwrap flags from given sandbox config
 def get_bwrap_args(sb: dict) -> list[str]:
+    # convert the camel-cased options to kebab-case used by bwrap
     def bwrap_name(name: str) -> str:
-        if name == "argv0":
+        # special case, we don't want to get 'argv-0', 'userns-2':
+        if name in ("argv0", "userns2"):
             return name
         return re.sub(r"(?<=[a-z])([A-Z0-9+])", lambda m: "-" + m.group(1).lower(), name)
 
-    def format_seccomp_value(value) -> str:
+    # TODO: the input 'value' type can never be list, only dict or int, no?
+    def format_seccomp_value(value: dict|list|int) -> str:
         if isinstance(value, dict):  # {data: string, arch: string}
             value = [value]
 
@@ -224,10 +247,11 @@ def get_bwrap_args(sb: dict) -> list[str]:
         else:  # fd
             return str(value)
 
-    def format_option_value(name, value) -> str:
-        if name in ("seccomp", "addSeccomp"):
+    # TODO: what are the possible 'value' types? is it dict|list|int|str?
+    def format_option_value(opt_name: str, value) -> str:
+        if opt_name in ("seccomp", "addSeccomp"):
             return format_seccomp_value(value)
-        elif name in ("userns", "userns2", "pidns", "syncFd", "blockFd", "userNsBlockFd", "infoFd", "jsonStatusFd"):
+        elif opt_name in ("userns", "userns2", "pidns", "syncFd", "blockFd", "userNsBlockFd", "infoFd", "jsonStatusFd"):
             return str(value)
         else:
             return str(value).format(**format_vars)
@@ -249,8 +273,8 @@ def get_bwrap_args(sb: dict) -> list[str]:
     format_vars = {**sb["vars"], "env": {**os.environ, **sb["env"]}}
     args: list[str] = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f)]
     for o in BWRAP_OPTIONS:
-        if sb.get(o) not in (False, None):
-            args.extend((f"--{bwrap_name(o)}", format_option_value(o, sb[o])))
+        if (v := sb.get(o)) not in (False, None):
+            args.extend((f"--{bwrap_name(o)}", format_option_value(o, v)))
     for o in BWRAP_LIST_OPTIONS:
         for v in sb.get(o, ()):
             if v not in (False, None):
@@ -260,6 +284,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
         args.extend(("--unsetenv", e))
     for k, v in sb["env"].items():
         args.extend(("--setenv", k, v))
+    # dest_path being in sandbox
     for dest_path, mount in sorted(sb["mounts"].items()):
         if mount in ("proc", "dev", "tmpfs", "mqueue", "dir"):
             args.extend((f"--{mount}", dest_path.format(**format_vars)))
@@ -282,7 +307,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 src_path = os.path.expanduser(bind.get("path", dest_path).format(**format_vars))
                 if bind.get("create"):
                     os.makedirs(src_path, exist_ok=True)
-                args.extend(("--" + prefix + "bind" + suffix, src_path, dest_path))
+                args.extend((f"--{prefix}bind{suffix}", src_path, dest_path))
             elif (fd := mount.get("fd")) is not None:  # { fd: { fd: number; readOnly?: boolean }}
                 args.extend(("--ro-bind-fd" if fd.get("readOnly") else "--bind-fd", str(fd["fd"])))
             elif (file := mount.get("file")) is not None:  # { file: DataSource & { perms?: number }}
@@ -298,7 +323,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
                     args.extend(("--overlay-src", lower.format(**format_vars)))
                 mode = overlay.get("mode", "rw" if "upper" in overlay and "work" in overlay else "tmp")
                 if mode == "rw":
-                    args.extend(("--overlay", overlay["upper"], overlay["work"], dest_path))
+                    args.extend(("--overlay", overlay["upper"], overlay["work"], dest_path))  # i.e. --overlay RWSRC WORKDIR DEST
                 else:
                     args.extend((f"--{mode}-overlay", dest_path))
             else:
@@ -312,18 +337,32 @@ def get_bwrap_args(sb: dict) -> list[str]:
     return args
 
 
+# resolve options to be passed to `xdg-dbus-proxy`
+# 'bus' arg is system|user
 def get_dbus_proxy_args(sb: dict, bus: str) -> list[str]:
     args: list[str] = []
-    if sb.get("dbus", {}).get("sloppyNames", {}).get(bus):
+    if not (b := sb.get("dbus")):
+        return args
+
+    # TODO: how are sloppyNames supposed to be defined? atm it looks like it's a dict
+    #       sb.dbus.sloppyNames, but... why a dict? wouldn't it make more sense
+    #       to define it as a bool under dbus.<bus>.sloppyNames?
+    if b.get("sloppyNames", {}).get(bus):
         args.append("--sloppy-names")
-    for name, policy in sb.get("dbus", {}).get(bus, {}).items():
+    for name, policy in b.get(bus, {}).items():
         args.append(f"--{policy}={name}")
     for rule_type in ("broadcast", "call"):
-        for name, rules in sb.get("dbus", {}).get("rules", {}).get(bus, {}).get(rule_type, {}).keys():
+        # TODO: this iteration smells: [for name, rules] while iterating over list of keys:
+        #       shouldn't it be .items() instead?
+        # TODO2: wouldn't it make more sense to move 'rules' key under dbus.<bus>,
+        #        not the other way around as it is currently?
+        for name, rules in b.get("rules", {}).get(bus, {}).get(rule_type, {}).keys():
             args.extend(f"--broadcast={name}={rule}" for rule in rules)
     return args
 
 
+# if required so by the sb's config, start a xdg-dbus-proxy subprocess and
+# return additional bwrap parameters to pass to the main sandbox command
 def setup_dbus_proxy(sb: dict) -> list[str]:
     proxy_dir: str = f"{os.environ["XDG_RUNTIME_DIR"]}/xdg-dbus-proxy/bwrap-{os.getpid()}"
     proxy_bwrap_args: list[str] = ["--bind", proxy_dir, proxy_dir]
@@ -333,11 +372,11 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     )
 
     cmd_bwrap_args = []
-    args = []
+    dbus_proxy_args = []
     for bus, address, addr_env in buses:
         if bus_args := get_dbus_proxy_args(sb, bus):
-            args.extend((address, f"{proxy_dir}/{bus}", "--filter"))
-            args.extend(bus_args)
+            dbus_proxy_args.extend((address, f"{proxy_dir}/{bus}", "--filter"))
+            dbus_proxy_args.extend(bus_args)
 
             addr_path = address.removeprefix("unix:path=")
             proxy_bwrap_args.extend(("--bind", addr_path, addr_path))
@@ -345,32 +384,36 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
             if addr_env:
                 cmd_bwrap_args.extend(("--setenv", addr_env, address))
 
-    if not args:
+    if not dbus_proxy_args:
         return []
 
-    pr, pw = os.pipe2(0)
     os.makedirs(proxy_dir, exist_ok=True)
-    args = ["xdg-dbus-proxy", f"--fd={pw}"] + args
-    logging.debug("proxy args for dbus proxy: %r", shlex.join(args))
+    pr, pw = os.pipe2(0)
+    dbus_proxy_args = ["xdg-dbus-proxy", f"--fd={pw}"] + dbus_proxy_args
+    LOGGER.debug("proxy args for dbus proxy: %r", shlex.join(dbus_proxy_args))
+
+    # if 'dbus.sandbox' defined, then it means xdg-dbus-proxy itself is to be ran in bwrap as well:
     if proxy_sb := sb.get("dbus", {}).get("sandbox"):
-        proxy_sb = get_sandbox(merge_sandboxes([proxy_sb]))
+        proxy_sb = get_sandbox(merge_sandboxes((proxy_sb,)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
         debug_object("dbus proxy sandbox", proxy_sb)
+        # TODO: proxy_bwrap_args is not really used? I'm guessing it's to be used
+        #       2 lines down in 'dbus_proxy_args' definition _instead_ of the global BWRAP_ARGS?
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
-        args = ["bwrap", "--args", str(pipefd("\0".join(BWRAP_ARGS).encode("utf-8")))] + args
-        logging.debug("bwrap args for xdg-dbus-proxy for bus: %s", shlex.join(proxy_bwrap_args))
+        dbus_proxy_args = ["bwrap", "--args", str(pipefd("\0".join(BWRAP_ARGS).encode("utf-8")))] + dbus_proxy_args
+        LOGGER.debug("bwrap args for xdg-dbus-proxy for bus: %s", shlex.join(proxy_bwrap_args))
 
     if os.fork() == 0:
         os.close(pr)
-        os.execlp(args[0], *args)
+        os.execlp(dbus_proxy_args[0], *dbus_proxy_args)
     else:
         os.close(pw)
         assert os.read(pr, 1) == b"x"
         return ["--sync-fd", str(pr)] + cmd_bwrap_args
 
 
-def debug_object(label: str, obj):
-    if logging.getLogger().isEnabledFor(logging.DEBUG):
-        logging.debug(f"{label}:\n{pprint.pformat(obj)}")
+def debug_object(label: str, obj: Any):
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug(f"{label}:\n{pprint.pformat(obj)}")
 
 
 # ENTRY
@@ -391,7 +434,7 @@ parser.add_argument("args", nargs=argparse.REMAINDER)
 args: argparse.Namespace = parser.parse_args()
 
 if args.log_level:
-    logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
+    logging.basicConfig(stream=sys.stdout, level=getattr(logging, args.log_level.upper()), force=True)
 
 for global_path in (Path.home() / ".config" / "sandbox.yaml", Path.home() / ".config" / "sandbox.yml"):
     if global_path.exists():
@@ -461,6 +504,7 @@ DBUS_PROXY_ARGS: list[str] = setup_dbus_proxy(SB)
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS.extend(DBUS_PROXY_ARGS)
 
-logging.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [args.executable] + args.args))
-os.execlp("bwrap", "bwrap", "--args", str(pipefd("\0".join(BWRAP_ARGS).encode("utf-8"))), args.executable or EXECUTABLE_NAME, *args.args)
+LOGGER.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [args.executable or EXECUTABLE_NAME] + args.args))
+os.execlp("bwrap", "bwrap", "--args", str(pipefd("\0".join(BWRAP_ARGS).encode("utf-8"))),
+          args.executable or EXECUTABLE_NAME, *args.args)
 
