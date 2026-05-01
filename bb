@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 from collections.abc import Iterable, Sequence
+from typing import Any
 import platform
 import pprint
 import re
@@ -35,7 +36,7 @@ MERGE_POLICY: dict[str, set[str]] = {
 
 def tagged_append(tag: str, dest: list[tuple[str,str]]):
     class TaggedAppend(argparse.Action):
-        def __call__(self, parser, ns, values, option_string=None):
+        def __call__(self, parser, ns, values, option_string: str|None=None):
             dest.append((tag, values))
     return TaggedAppend
 
@@ -97,7 +98,7 @@ def merge(a: dict, b: dict, path: list[str]=[]) -> dict:
             case "dict":
                 res[k] = merge(a.get(k, {}), b.get(k, {}), key_path)
             case "literal":
-                res[k] = b.get(k, a.get(k, None))
+                res[k] = b.get(k, a.get(k))
             # TODO: no need to handle "discard" case as its name implies, right?
     return res
 
@@ -121,7 +122,7 @@ def merge_sandboxes(sandboxes: Iterable[dict]) -> dict:
 
     res = {}
     for sb in sandboxes:
-        inc = merge_sandboxes(load_include(child_sb) for child_sb in sb.get("include", []))
+        inc = merge_sandboxes(load_include(child_sb) for child_sb in sb.get("include", ()))
         res = merge(res, merge(inc, sb))
     return res
 
@@ -152,9 +153,9 @@ def get_sandbox(sb: dict) -> dict:
                 else:
                     raw_env[k] = v["defaultValue"]
             elif "value" in v:
-                # TODO: should it not go in raw_env dict if v.get("raw") is true?
+                # TODO: should it not go in raw_env dict if v.get("raw") is truthy?
                 #       if not, then perhaps "raw" key in v would be better named something like "asis"?
-                if v.get("raw", False):
+                if v.get("raw"):
                     env[k] = v["value"]
                 else:
                     raw_env[k] = v["value"]
@@ -184,16 +185,17 @@ def get_sandbox(sb: dict) -> dict:
         if not (raw_env or raw_vars):
             break  # all raw values were processed/expanded
         if not changed:
+            # TODO: should we not raise a proper error here?
             assert False  # circular definition
 
     # Parse mounts & chmod
-    mounts = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("mounts", []) if v}
-    chmod = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("chmod", []) if v}
+    mounts: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("mounts", {}) if v}
+    chmod: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("chmod", {}) if v}
 
     return {**sb, "vars": vars, "env": env, "envUnset": env_unset, "mounts": mounts, "chmod": chmod}
 
 
-def pipefd(data):
+def pipefd(data: bytes):
     pr, pw  = os.pipe2(0)
     if os.fork() == 0:
         os.close(pr)
@@ -215,7 +217,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
             value = [value]
 
         if isinstance(value, list):  # {data: string, arch: string}[]
-            data = [base64.b64decode(prog["data"]) for prog in value if prog["arch"] == platform.machine()]
+            data: list[bytes] = [base64.b64decode(prog["data"]) for prog in value if prog["arch"] == platform.machine()]
             if len(data) == 0:
                 raise Exception(f"seccomp program not found for our architecture: {platform.machine()}")
             return str(pipefd(data[0]))
@@ -242,19 +244,18 @@ def get_bwrap_args(sb: dict) -> list[str]:
             else:
                 content = content.encode("utf-8")
             return str(pipefd(content))
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
 
     format_vars = {**sb["vars"], "env": {**os.environ, **sb["env"]}}
-    args = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f)]
+    args: list[str] = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f)]
     for o in BWRAP_OPTIONS:
         if sb.get(o) not in (False, None):
             args.extend((f"--{bwrap_name(o)}", format_option_value(o, sb[o])))
     for o in BWRAP_LIST_OPTIONS:
-        for v in sb.get(o, []):
+        for v in sb.get(o, ()):
             if v not in (False, None):
                 args.extend((f"--{bwrap_name(o)}", format_option_value(o, v)))
-    args.extend(arg.format(**format_vars) for arg in sb.get("extraArgs", []))
+    args.extend(arg.format(**format_vars) for arg in sb.get("extraArgs", ()))
     for e in sb["envUnset"]:
         args.extend(("--unsetenv", e))
     for k, v in sb["env"].items():
@@ -303,15 +304,17 @@ def get_bwrap_args(sb: dict) -> list[str]:
             else:
                 raise Exception(f"invalid mount value: {repr(mount)}")
         else:
-            raise Exception(f"invalid mount value: {repr(mount)}")
+            raise Exception(f"invalid mount (of type {type(mount)}) value: {repr(mount)}")
+    # TODO: isn't chmod a map? sorted(sb["chmod"]) would return _list_ of sorted keys.
+    #       think we need to sort on sb[chmod].items(), i.e. same as is done with mounts above
     for path, mode in sorted(sb["chmod"]):
         args.extend(("--chmod", path.format(**format_vars), str(mode)))
     return args
 
 
 def get_dbus_proxy_args(sb: dict, bus: str) -> list[str]:
-    args = []
-    if sb.get("dbus", {}).get("sloppyNames", {}).get(bus, False):
+    args: list[str] = []
+    if sb.get("dbus", {}).get("sloppyNames", {}).get(bus):
         args.append("--sloppy-names")
     for name, policy in sb.get("dbus", {}).get(bus, {}).items():
         args.append(f"--{policy}={name}")
@@ -323,7 +326,7 @@ def get_dbus_proxy_args(sb: dict, bus: str) -> list[str]:
 
 def setup_dbus_proxy(sb: dict) -> list[str]:
     proxy_dir: str = f"{os.environ["XDG_RUNTIME_DIR"]}/xdg-dbus-proxy/bwrap-{os.getpid()}"
-    proxy_bwrap_args = ["--bind", proxy_dir, proxy_dir]
+    proxy_bwrap_args: list[str] = ["--bind", proxy_dir, proxy_dir]
     buses: Sequence[tuple[str,str,str|None]] = (
         ("system", "unix:path=/run/dbus/system_bus_socket", None),
         ("user", os.environ["DBUS_SESSION_BUS_ADDRESS"], "DBUS_SESSION_BUS_ADDRESS"),
@@ -432,7 +435,7 @@ if args.autoload:
 
 if not args.no_match:
     for sb in GLOBAL_SANDBOXES:
-        if EXECUTABLE_NAME in sb.get("matches", []) and sb not in CONFIGS:
+        if EXECUTABLE_NAME in sb.get("matches", ()) and sb not in CONFIGS:
             CONFIGS.append(sb)
 
 if not CONFIGS and not args.no_default:
