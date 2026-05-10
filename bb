@@ -302,6 +302,11 @@ def get_bwrap_args(sb: dict) -> list[str]:
             # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
             #       key formatting was already done in the end of get_sandbox()?
             args.extend((f"--{mount}", dest_path.format(**format_vars)))
+        elif mount in ("bind", "bind-try", "ro-bind", "ro-bind-try", "dev-bind", "dev-bind-try"):  # convenience, SRC & DEST will be the same
+            # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
+            #       key formatting was already done in the end of get_sandbox()?
+            p = dest_path.format(**format_vars)
+            args.extend((f"--{mount}", p, p))
         elif isinstance(mount, dict):
             if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
                 if (perms := tmpfs.get("perms")) is not None:
