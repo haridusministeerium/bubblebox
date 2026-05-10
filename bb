@@ -42,6 +42,8 @@ MERGE_POLICIES: dict[str, set[str]] = {
   "list": BWRAP_LIST_OPTIONS.union({"extraArgs"}).union({"matches", "dbus.rules.*.*.*"}),
   "dict": {"vars", "env", "dbus", "dbus.sloppyNames", "dbus.sandbox",
            "dbus.user", "dbus.system", "dbus.rules.*", "dbus.rules.*.*"},
+  # TODO: is it intentional we're not merging 'include'? if so, why's that?
+  #       to avoid circular dependencies?
   "discard": {"name", "include"},
 }
 
@@ -80,7 +82,7 @@ def try_load_sandbox(name: str) -> dict|None:
 
 def load_sandbox(name: str) -> dict:
     if (sb := try_load_sandbox(name)) is None:
-        raise Exception(f"sandbox not found: {name}")
+        raise Exception(f"[{name}] sandbox not found")
     return sb
 
 
@@ -165,14 +167,19 @@ def get_sandbox(sb: dict) -> dict:
         elif isinstance(v, str):
             raw_env[k] = v
         elif isinstance(v, dict):
+            # TODO: consider renaming "inherits" to "ordefault"/"withdefault".
+            #       or perhaps require/support _only_ "defaultValue" key if v = dict? this requires deprecation of "value" as suggested below.
             if "inherits" in v:
-                if k in os.environ or "defaultValue" not in v:
+                if k in os.environ:
                     env[k] = os.environ[k]
+                #elif "defaultValue" in v:
                 else:
-                    raw_env[k] = v["defaultValue"]
+                    raw_env[k] = v["defaultValue"]  # note here we expect/require "defaultValue" key to be present
             elif "value" in v:
                 # TODO: should it not go in raw_env dict if v.get("raw") is truthy?
                 #       if not, then perhaps "raw" key in v would be better named something like "asis"?
+                #       note the effective difference is that only values in raw_env get expanded later on.
+                #       better yet, why not deprecate the "value" key option in env dict altogether?
                 if v.get("raw"):
                     env[k] = v["value"]
                 else:
@@ -189,7 +196,7 @@ def get_sandbox(sb: dict) -> dict:
     vars = {**DEFAULT_VARS}
     format_vars = {**vars, "env": {**os.environ, **env}}
     while True:
-        changed = False
+        changed: bool = False
         for parsed, raw in ((vars, raw_vars), (env, raw_env)):
             for k in list(raw.keys()):
                 try:
@@ -213,8 +220,8 @@ def get_sandbox(sb: dict) -> dict:
     return {**sb, "vars": vars, "env": env, "envUnset": env_unset, "mounts": mounts, "chmod": chmod}
 
 
-# returns read end of the pipe
-def pipefd(data: bytes) -> int:
+# returns string representation of read end of the pipe FD
+def pipefd(data: bytes) -> str:
     pr, pw  = os.pipe2(0)
     if os.fork() == 0:
         os.close(pr)
@@ -222,7 +229,7 @@ def pipefd(data: bytes) -> int:
         sys.exit(0)  # immediately exit the child process
     else:
         os.close(pw)
-        return pr
+        return str(pr)
 
 
 # resolve bwrap flags from given sandbox config
@@ -235,15 +242,19 @@ def get_bwrap_args(sb: dict) -> list[str]:
         return re.sub(r"(?<=[a-z])([A-Z0-9+])", lambda m: "-" + m.group(1).lower(), name)
 
     # TODO: the input 'value' type can never be list, only dict or int, no?
+    #       edit: think it can be list with 'seccomp' after all
     def format_seccomp_value(value: dict|list|int) -> str:
         if isinstance(value, dict):  # {data: string, arch: string}
             value = [value]
 
         if isinstance(value, list):  # {data: string, arch: string}[]
+            # TODO:
             data: list[bytes] = [base64.b64decode(prog["data"]) for prog in value if prog["arch"] == platform.machine()]
             if len(data) == 0:
                 raise Exception(f"seccomp program not found for our architecture: {platform.machine()}")
-            return str(pipefd(data[0]))
+            elif len(data) != 1:
+                raise Exception(f"{len(data)} seccomp programs found for our architecture {platform.machine()}, expected 1")
+            return pipefd(data[0])
         else:  # fd
             return str(value)
 
@@ -267,7 +278,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 content = base64.b64decode(content)
             else:
                 content = content.encode("utf-8")
-            return str(pipefd(content))
+            return pipefd(content)
         raise NotImplementedError
 
     format_vars = {**sb["vars"], "env": {**os.environ, **sb["env"]}}
@@ -284,9 +295,12 @@ def get_bwrap_args(sb: dict) -> list[str]:
         args.extend(("--unsetenv", e))
     for k, v in sb["env"].items():
         args.extend(("--setenv", k, v))
-    # dest_path being in sandbox
+
+    # note dest_path is in the sandbox
     for dest_path, mount in sorted(sb["mounts"].items()):
         if mount in ("proc", "dev", "tmpfs", "mqueue", "dir"):
+            # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
+            #       key formatting was already done in the end of get_sandbox()?
             args.extend((f"--{mount}", dest_path.format(**format_vars)))
         elif isinstance(mount, dict):
             if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
@@ -331,32 +345,37 @@ def get_bwrap_args(sb: dict) -> list[str]:
         else:
             raise Exception(f"invalid mount (of type {type(mount)}) value: {repr(mount)}")
     # TODO: isn't chmod a map? sorted(sb["chmod"]) would return _list_ of sorted keys.
-    #       think we need to sort on sb[chmod].items(), i.e. same as is done with mounts above
+    #       think we need to sort on sb[chmod].items(), i.e. same as is done with mounts above.
+    # TODO: is there need to do path.format(**format_vars) anymore, given
+    #       key formatting was already done in the end of get_sandbox()?
     for path, mode in sorted(sb["chmod"]):
         args.extend(("--chmod", path.format(**format_vars), str(mode)))
     return args
 
 
-# resolve options to be passed to `xdg-dbus-proxy`
+# resolve options to be passed to `xdg-dbus-proxy`.
 # 'bus' arg is system|user
 def get_dbus_proxy_args(sb: dict, bus: str) -> list[str]:
     args: list[str] = []
-    if not (b := sb.get("dbus")):
+    if not ((b := sb.get("dbus")) and ((bb := b.get(bus)) is not None)):
         return args
 
     # TODO: how are sloppyNames supposed to be defined? atm it looks like it's a dict
     #       sb.dbus.sloppyNames, but... why a dict? wouldn't it make more sense
     #       to define it as a bool under dbus.<bus>.sloppyNames?
+    #       !! Additionally -- as it stands -- even if say dbus.system is not defined
+    #       in the config, then a system bus would still get initialized if
+    #       dbus.sloppyNames is defined!
     if b.get("sloppyNames", {}).get(bus):
         args.append("--sloppy-names")
-    for name, policy in b.get(bus, {}).items():
+    for name, policy in bb.items():
         args.append(f"--{policy}={name}")
     for rule_type in ("broadcast", "call"):
         # TODO: this iteration smells: [for name, rules] while iterating over list of keys:
         #       shouldn't it be .items() instead?
-        # TODO2: wouldn't it make more sense to move 'rules' key under dbus.<bus>,
-        #        not the other way around as it is currently?
         for name, rules in b.get("rules", {}).get(bus, {}).get(rule_type, {}).keys():
+            # TODO: think it should be "--{rule_type}={name}={rule}", as currently
+            #       'call' rules are also defined as --broadcast
             args.extend(f"--broadcast={name}={rule}" for rule in rules)
     return args
 
@@ -371,8 +390,8 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         ("user", os.environ["DBUS_SESSION_BUS_ADDRESS"], "DBUS_SESSION_BUS_ADDRESS"),
     )
 
-    cmd_bwrap_args = []
-    dbus_proxy_args = []
+    cmd_bwrap_args: list[str] = []
+    dbus_proxy_args: list[str] = []
     for bus, address, addr_env in buses:
         if bus_args := get_dbus_proxy_args(sb, bus):
             dbus_proxy_args.extend((address, f"{proxy_dir}/{bus}", "--filter"))
@@ -385,7 +404,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
                 cmd_bwrap_args.extend(("--setenv", addr_env, address))
 
     if not dbus_proxy_args:
-        return []
+        return []  # no dbus proxies configured
 
     os.makedirs(proxy_dir, exist_ok=True)
     pr, pw = os.pipe2(0)
@@ -399,7 +418,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         # TODO: proxy_bwrap_args is not really used? I'm guessing it's to be used
         #       2 lines down in 'dbus_proxy_args' definition _instead_ of the global BWRAP_ARGS?
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
-        dbus_proxy_args = ["bwrap", "--args", str(pipefd("\0".join(BWRAP_ARGS).encode("utf-8")))] + dbus_proxy_args
+        dbus_proxy_args = ["bwrap", "--args", pipefd("\0".join(BWRAP_ARGS).encode("utf-8"))] + dbus_proxy_args
         LOGGER.debug("bwrap args for xdg-dbus-proxy for bus: %s", shlex.join(proxy_bwrap_args))
 
     if os.fork() == 0:
@@ -418,7 +437,7 @@ def debug_object(label: str, obj: Any):
 
 # ENTRY
 #################################
-CONFIGS_SOURCES: list[tuple[str,str]] = []  # contains (passed-option, value) tuples, e.g. ('name', 'value-for-name'), ('json', '{some-json: data}')
+CONFIGS_SOURCES: list[tuple[str,str]] = []  # contains (passed-option, value) tuples, e.g. ('name', 'value-for-name'), ('json', '{"some-key":"some-val"}')
 parser = argparse.ArgumentParser()
 parser.add_argument("-l", "--log-level", choices=[lvl.lower() for lvl in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")])
 parser.add_argument("-n", "--name", action=tagged_append("name", CONFIGS_SOURCES))  # can be a comma-separated list
@@ -440,11 +459,11 @@ for global_path in (Path.home() / ".config" / "sandbox.yaml", Path.home() / ".co
     if global_path.exists():
         GLOBAL_SANDBOXES = load_sandboxes_file(global_path)
 
-CONFIGS: list[dict] = []  # active sandbox configs to use
+CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a single sandbox config
 for source_type, source_data in CONFIGS_SOURCES:
     match source_type:
         case "name":
-            for name in source_data.split(","):
+            for name in [n.strip() for n in source_data.split(",") if n.strip()]:
                 CONFIGS.append(load_sandbox(name.strip()))
         case "json":
             CONFIGS.append(json.loads(source_data))
@@ -452,7 +471,7 @@ for source_type, source_data in CONFIGS_SOURCES:
             CONFIGS.extend(load_sandboxes_file(source_data))
         case "set":
             k, v = source_data.split("=", 1)
-            k = re.sub(r"^\$", "env.", re.sub("^:", "vars.", k))
+            k = re.sub(r"^\$", "env.", re.sub(r"^:", "vars.", k))
             v = json.loads(v) if v and (v[0] in '"[{'or v in ("true", "false", "null")) else v
             obj = {}
             cur = obj
@@ -496,6 +515,7 @@ DEFAULT_VARS: dict[str, str|int] = {
 SB = get_sandbox(merge_sandboxes(CONFIGS))
 debug_object("sandbox", SB)
 
+# TODO: consider removing this option:
 if SB.get("disableSandbox"):
     os.execlp(args.executable, args.executable, *args.args)
 
@@ -505,6 +525,8 @@ BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS.extend(DBUS_PROXY_ARGS)
 
 LOGGER.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [args.executable or EXECUTABLE_NAME] + args.args))
-os.execlp("bwrap", "bwrap", "--args", str(pipefd("\0".join(BWRAP_ARGS).encode("utf-8"))),
+os.execlp("bwrap", "bwrap", "--args", pipefd("\0".join(BWRAP_ARGS).encode("utf-8")),
           args.executable or EXECUTABLE_NAME, *args.args)
 
+# TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten
+# TODO: consider renaming 'path' key in mount config to 'src'
