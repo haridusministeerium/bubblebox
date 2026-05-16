@@ -31,7 +31,9 @@ https://github.com/capnspacehook/egress-eddie
 - create config validator. also unknown config keys shouldn't simply be
   ignored, but should result in an exception
 - to the validation end, consider pydantic, but past experience suggests it
-  adds non-insignificant delay to startup. perhaps `TypedDict`?
+  adds non-insignificant delay to startup. perhaps `TypedDict`? even better, try
+  TypedDict [with pydantic](https://pydantic.dev/docs/validation/latest/concepts/performance/#use-typeddict-over-nested-models),
+  using its `TypeAdapter`;
 - why do we use camel-case in config only having to convert it to kebab
   used by bwrap via bwrap_name()? would make everyone's lives easier by using kebab everywhere.
 

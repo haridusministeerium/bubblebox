@@ -34,14 +34,30 @@ BWRAP_OPTIONS: set[str] = {"argv0", "userns", "userns2", "pidns", "uid", "gid",
 # bwrap options that may be defined multiple times:
 BWRAP_LIST_OPTIONS: set[str] = {"addSeccompFd", "capAdd", "capDrop", "lockFile", "remountRo"}
 
+# TODO: instead of our merge logic, consider using pydash's merge_with() (http://static.aryehleib.com/pydash/api.html#pydash.objects.merge_with)
+#       and write the policies into the callback customizer arg.
+#       NOTE: it WILL introduce dependency on pydash
 MERGE_POLICIES: dict[str, set[str]] = {
-  "items": {"mounts", "chmod"},
+  # note rules.{broadcast,call}.* get merged by "items" policy, as we assume
+  # there can be e.g. multiple `--broadcast=org.freedesktop.portal.*=@...` rules
+  #
+  # TODO: shouldn't mounts & chmod items be merged by 'literal' policy? we
+  #       can't bind multiple sources to the same target (target being the key),
+  #       so it doesn't make much sense. also both get transformed into dict at
+  #       the end of get_sandbox() without further processing
+  "items": {"mounts", "chmod", "dbus.rules.*", "dbus.user.rules.*", "dbus.system.rules.*"},
   # TODO: wouldn't "override" or "overwrite" be a better name than "literal"?
-  "literal": BWRAP_FLAGS.union(BWRAP_OPTIONS).union({"disableSandbox", "vars.*", "env.*", "dbus.sloppyNames.*",
-                                                     "dbus.sandbox.*", "dbus.user.*", "dbus.system.*"}),
-  "list": BWRAP_LIST_OPTIONS.union({"extraArgs"}).union({"matches", "dbus.rules.*.*.*"}),
-  "dict": {"vars", "env", "dbus", "dbus.sloppyNames", "dbus.sandbox",
-           "dbus.user", "dbus.system", "dbus.rules.*", "dbus.rules.*.*"},
+  "literal": BWRAP_FLAGS
+        .union(BWRAP_OPTIONS)
+        .union({"disableSandbox", "vars.*", "env.*", "dbus.sloppyNames",
+                "dbus.user.sloppyNames", "dbus.system.sloppyNames",
+                "dbus.sandbox.*", "dbus.policies.*", "dbus.user.policies.*",
+                "dbus.system.policies.*"}),
+  "list": BWRAP_LIST_OPTIONS
+        .union({"extraArgs", "matches"}),
+  "dict": {"vars", "env", "dbus", "dbus.sandbox", "dbus.policies",
+           "dbus.user.policies", "dbus.system.policies", "dbus.user", "dbus.system",
+           "dbus.rules", "dbus.user.rules", "dbus.system.rules"},
   # TODO: is it intentional we're not merging 'include'? if so, why's that?
   #       to avoid circular dependencies?
   "discard": {"name", "include"},
@@ -68,22 +84,22 @@ def load_sandboxes_file(path: Path|str, default_name: str|None=None) -> list[dic
 def try_load_sandbox(name: str) -> dict|None:
     if name in SANDBOXES_CACHE:
         return SANDBOXES_CACHE[name]
-    candidate_paths = [
+    candidate_paths: Sequence[Path] = (
         Path(name),
         Path(f"{name}.yml"),
         Path(f"{name}.yaml"),
         Path.home() / ".config" / "sandbox" / f"{name}.yml",
         Path.home() / ".config" / "sandbox" / f"{name}.yaml",
-    ]
+    )
     for p in candidate_paths:
         if p.exists():
             return load_sandboxes_file(p, name)[0]
 
 
 def load_sandbox(name: str) -> dict:
-    if (sb := try_load_sandbox(name)) is None:
-        raise Exception(f"[{name}] sandbox not found")
-    return sb
+    if (sb := try_load_sandbox(name)) is not None:
+        return sb
+    raise Exception(f"[{name}] sandbox not found")
 
 
 def get_merge_policy(path: list[str], k: str) -> tuple[str, list[str]]:
@@ -97,7 +113,7 @@ def get_merge_policy(path: list[str], k: str) -> tuple[str, list[str]]:
     raise Exception(f"Unknown key while merging: {".".join(path + [k])}")
 
 
-def merge(a: dict, b: dict, path: list[str]=[]) -> dict:
+def merge(a: dict[str, Any], b: dict[str, Any], path: list[str]=[]) -> dict[str, Any]:
     res = {}
     for k in set(a.keys()).union(b.keys()):
         policy, key_path = get_merge_policy(path, k)
@@ -107,9 +123,6 @@ def merge(a: dict, b: dict, path: list[str]=[]) -> dict:
             case "items":
                 left = a.get(k, {})
                 right = b.get(k, {})
-                # TODO: is this merge correct? e.g. mounts' dict would get merged
-                #       into list of (k, v) tuples. think 'items' policy needs to
-                #       be removed, and (mounts, chmod) should be merged by 'literal'
                 res[k] = (list(left.items()) if isinstance(left, dict) else left) + \
                     (list(right.items()) if isinstance(right, dict) else right)
             case "dict":
@@ -209,15 +222,16 @@ def get_sandbox(sb: dict) -> dict:
         format_vars = {**vars, "env": {**os.environ, **env}}
         if not (raw_env or raw_vars):
             break  # all raw values were processed/expanded
-        if not changed:
+        elif not changed:
             # TODO: should we not raise a proper error here?
             assert False  # circular definition
 
-    # Parse mounts & chmod
-    mounts: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("mounts", {}) if v}
-    chmod: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("chmod", {}) if v}
+    # Parse mounts & chmod; note sb[mounts|chmod] are tuple[key,v] because of 'items' merge policy:
+    mounts: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("mounts", ()) if v}
+    chmod: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("chmod", ()) if v}
 
-    return {**sb, "vars": vars, "env": env, "envUnset": env_unset, "mounts": mounts, "chmod": chmod}
+    return {**sb, "vars": vars, "env": env, "envUnset": env_unset,
+            "mounts": mounts, "chmod": chmod}
 
 
 # returns string representation of read end of the pipe FD
@@ -262,7 +276,8 @@ def get_bwrap_args(sb: dict) -> list[str]:
     def format_option_value(opt_name: str, value) -> str:
         if opt_name in ("seccomp", "addSeccomp"):
             return format_seccomp_value(value)
-        elif opt_name in ("userns", "userns2", "pidns", "syncFd", "blockFd", "userNsBlockFd", "infoFd", "jsonStatusFd"):
+        elif opt_name in ("userns", "userns2", "pidns", "syncFd", "blockFd",
+                          "userNsBlockFd", "infoFd", "jsonStatusFd"):
             return str(value)
         else:
             return str(value).format(**format_vars)
@@ -359,57 +374,60 @@ def get_bwrap_args(sb: dict) -> list[str]:
 
 
 # resolve options to be passed to `xdg-dbus-proxy`.
-# 'bus' arg is system|user
-def get_dbus_proxy_args(sb: dict, bus: str) -> list[str]:
+# 'bus_name' arg is system|user
+def get_dbus_proxy_args(dbus: dict, bus_name: str) -> list[str]:
+    b: dict = dbus[bus_name] or {}  # because empty user|system key in yaml would translate to None value
     args: list[str] = []
-    if not ((b := sb.get("dbus")) and ((bb := b.get(bus)) is not None)):
-        return args
-
-    # TODO: how are sloppyNames supposed to be defined? atm it looks like it's a dict
-    #       sb.dbus.sloppyNames, but... why a dict? wouldn't it make more sense
-    #       to define it as a bool under dbus.<bus>.sloppyNames?
-    #       !! Additionally -- as it stands -- even if say dbus.system is not defined
-    #       in the config, then a system bus would still get initialized if
-    #       dbus.sloppyNames is defined!
-    if b.get("sloppyNames", {}).get(bus):
+    if b.get("sloppyNames", dbus.get("sloppyNames", False)) is True:
         args.append("--sloppy-names")
-    for name, policy in bb.items():
-        args.append(f"--{policy}={name}")
+
+    policies: dict[str, str] = {**dbus.get("policies", {}), **b.get("policies", {})}
+    args.extend(f"--{policy}={name}" for name, policy in policies.items())
+
     for rule_type in ("broadcast", "call"):
-        # TODO: this iteration smells: [for name, rules] while iterating over list of keys:
-        #       shouldn't it be .items() instead?
-        for name, rules in b.get("rules", {}).get(bus, {}).get(rule_type, {}).keys():
-            # TODO: think it should be "--{rule_type}={name}={rule}", as currently
-            #       'call' rules are also defined as --broadcast
-            args.extend(f"--broadcast={name}={rule}" for rule in rules)
+        ruleset: list[tuple[str, str]] = dbus.get("rules", {}).get(rule_type, []) + \
+                                         b.get("rules", {}).get(rule_type, [])
+        args.extend(f"--{rule_type}={name}={rule}" for name, rule in ruleset)
     return args
 
 
 # if required so by the sb's config, start a xdg-dbus-proxy subprocess and
 # return additional bwrap parameters to pass to the main sandbox command
 def setup_dbus_proxy(sb: dict) -> list[str]:
-    proxy_dir: str = f"{os.environ["XDG_RUNTIME_DIR"]}/xdg-dbus-proxy/bwrap-{os.getpid()}"
-    proxy_bwrap_args: list[str] = ["--bind", proxy_dir, proxy_dir]
+    if not (dbus := sb.get("dbus")):
+        if "dbus" in sb:  # sanity
+            raise Exception("empty [dbus] key/block not allowed")
+        return []  # no dbus proxies configured, bail
+
+    runtime_dir: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    proxy_dir: str = f"{runtime_dir}/xdg-dbus-proxy/bwrap-{os.getpid()}"
+
+    unix_path_prefix: str = "unix:path="
+    dbus_session_address: str = os.environ.get("DBUS_SESSION_BUS_ADDRESS", f"{unix_path_prefix}/run/user/{os.getuid()}/bus")
     buses: Sequence[tuple[str,str,str|None]] = (
-        ("system", "unix:path=/run/dbus/system_bus_socket", None),
-        ("user", os.environ["DBUS_SESSION_BUS_ADDRESS"], "DBUS_SESSION_BUS_ADDRESS"),
+        ("system", f"{unix_path_prefix}/run/dbus/system_bus_socket", None),
+        ("user", dbus_session_address, "DBUS_SESSION_BUS_ADDRESS"),
     )
 
+    proxy_bwrap_args: list[str] = ["--bind", proxy_dir, proxy_dir]
     cmd_bwrap_args: list[str] = []
     dbus_proxy_args: list[str] = []
     for bus, address, addr_env in buses:
-        if bus_args := get_dbus_proxy_args(sb, bus):
-            dbus_proxy_args.extend((address, f"{proxy_dir}/{bus}", "--filter"))
-            dbus_proxy_args.extend(bus_args)
+        if bus not in dbus:
+            continue
+        dbus_proxy_args.extend((address, f"{proxy_dir}/{bus}", "--filter"))
+        bus_args: list[str] = get_dbus_proxy_args(dbus, bus)
+        dbus_proxy_args.extend(bus_args)
 
-            addr_path = address.removeprefix("unix:path=")
-            proxy_bwrap_args.extend(("--bind", addr_path, addr_path))
-            cmd_bwrap_args.extend(("--bind", f"{proxy_dir}/{bus}", addr_path))
-            if addr_env:
-                cmd_bwrap_args.extend(("--setenv", addr_env, address))
+        addr_path = address.removeprefix(unix_path_prefix)
+        proxy_bwrap_args.extend(("--bind", addr_path, addr_path))
+        cmd_bwrap_args.extend(("--bind", f"{proxy_dir}/{bus}", addr_path))
+        if addr_env:
+            cmd_bwrap_args.extend(("--setenv", addr_env, address))
 
-    if not dbus_proxy_args:
-        return []  # no dbus proxies configured
+    if not dbus_proxy_args:  # sanity
+        prefix = f"[{sb['name']}] " if "name" in sb else ""
+        raise Exception(f"{prefix}sandbox has [dbus] block configured, but none of {[b[0] for b in buses]} buses under it")
 
     os.makedirs(proxy_dir, exist_ok=True)
     pr, pw = os.pipe2(0)
@@ -417,8 +435,8 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     LOGGER.debug("proxy args for dbus proxy: %r", shlex.join(dbus_proxy_args))
 
     # if 'dbus.sandbox' defined, then it means xdg-dbus-proxy itself is to be ran in bwrap as well:
-    if proxy_sb := sb.get("dbus", {}).get("sandbox"):
-        proxy_sb = get_sandbox(merge_sandboxes((proxy_sb,)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
+    if proxy_sb := dbus.get("sandbox"):
+        proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
         debug_object("dbus proxy sandbox", proxy_sb)
         # TODO: proxy_bwrap_args is not really used? I'm guessing it's to be used
         #       2 lines down in 'dbus_proxy_args' definition _instead_ of the global BWRAP_ARGS?
@@ -435,7 +453,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         return ["--sync-fd", str(pr)] + cmd_bwrap_args
 
 
-def debug_object(label: str, obj: Any):
+def debug_object(label: str, obj: object) -> None:
     if LOGGER.isEnabledFor(logging.DEBUG):
         LOGGER.debug(f"{label}:\n{pprint.pformat(obj)}")
 
@@ -468,8 +486,9 @@ CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a
 for source_type, source_data in CONFIGS_SOURCES:
     match source_type:
         case "name":
-            for name in [n.strip() for n in source_data.split(",") if n.strip()]:
-                CONFIGS.append(load_sandbox(name.strip()))
+            for name in [n.strip() for n in source_data.split(",")]:
+                if name:
+                    CONFIGS.append(load_sandbox(name))
         case "json":
             CONFIGS.append(json.loads(source_data))
         case "file":
@@ -496,8 +515,7 @@ for source_type, source_data in CONFIGS_SOURCES:
 EXECUTABLE_NAME: str = os.path.basename(args.executable or os.environ.get("SHELL", "sh"))
 
 if args.autoload:
-    sb: dict|None = try_load_sandbox(EXECUTABLE_NAME)
-    if sb and sb not in CONFIGS:
+    if (sb := try_load_sandbox(EXECUTABLE_NAME)) and sb not in CONFIGS:
         CONFIGS.append(sb)
 
 if not args.no_match:
@@ -535,3 +553,4 @@ os.execlp("bwrap", "bwrap", "--args", pipefd("\0".join(BWRAP_ARGS).encode("utf-8
 
 # TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten
 # TODO: consider renaming 'path' key in mount config to 'src'
+
