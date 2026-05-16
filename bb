@@ -262,7 +262,6 @@ def get_bwrap_args(sb: dict) -> list[str]:
             value = [value]
 
         if isinstance(value, list):  # {data: string, arch: string}[]
-            # TODO:
             data: list[bytes] = [base64.b64decode(prog["data"]) for prog in value if prog["arch"] == platform.machine()]
             if len(data) == 0:
                 raise Exception(f"seccomp program not found for our architecture: {platform.machine()}")
@@ -279,8 +278,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
         elif opt_name in ("userns", "userns2", "pidns", "syncFd", "blockFd",
                           "userNsBlockFd", "infoFd", "jsonStatusFd"):
             return str(value)
-        else:
-            return str(value).format(**format_vars)
+        return str(value).format(**format_vars)
 
     def format_datasource_value(value) -> str:  # {fd: number} | {content: string, raw?: boolean, base64?: boolean}
         if (fd := value.get("fd")) is not None:
@@ -364,12 +362,10 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 raise Exception(f"invalid mount value: {repr(mount)}")
         else:
             raise Exception(f"invalid mount (of type {type(mount)}) value: {repr(mount)}")
-    # TODO: isn't chmod a map? sorted(sb["chmod"]) would return _list_ of sorted keys.
-    #       think we need to sort on sb[chmod].items(), i.e. same as is done with mounts above.
     # TODO: is there need to do path.format(**format_vars) anymore, given
     #       key formatting was already done in the end of get_sandbox()?
-    for path, mode in sorted(sb["chmod"]):
-        args.extend(("--chmod", path.format(**format_vars), str(mode)))
+    for path, mode in sorted(sb["chmod"].items()):
+        args.extend(("--chmod", str(mode), path.format(**format_vars)))
     return args
 
 
