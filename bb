@@ -438,10 +438,8 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     if proxy_sb := dbus.get("sandbox"):
         proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
         debug_object("dbus proxy sandbox", proxy_sb)
-        # TODO: proxy_bwrap_args is not really used? I'm guessing it's to be used
-        #       2 lines down in 'dbus_proxy_args' definition _instead_ of the global BWRAP_ARGS?
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
-        dbus_proxy_args = ["bwrap", "--args", pipefd("\0".join(BWRAP_ARGS).encode("utf-8"))] + dbus_proxy_args
+        dbus_proxy_args = ["bwrap", "--args", pipefd("\0".join(proxy_bwrap_args).encode("utf-8"))] + dbus_proxy_args
         LOGGER.debug("bwrap args for xdg-dbus-proxy for bus: %s", shlex.join(proxy_bwrap_args))
 
     if os.fork() == 0:
