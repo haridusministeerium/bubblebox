@@ -19,6 +19,9 @@ import yaml
 
 LOGGER: logging.Logger = logging.getLogger()
 
+CONFIG_HOME: Path = Path(os.environ.get("XDG_CONFIG_HOME", os.environ["HOME"] + "/.config"))
+SB_CONFIG: Path = CONFIG_HOME / "sandbox"
+
 SANDBOXES_CACHE: dict[str, dict] = {}
 GLOBAL_SANDBOXES: list[dict] = []
 
@@ -43,8 +46,8 @@ MERGE_POLICIES: dict[str, set[str]] = {
   #
   # TODO: shouldn't mounts & chmod items be merged by 'literal' policy? we
   #       can't bind multiple sources to the same target (target being the key),
-  #       so it doesn't make much sense. also both get transformed into dict at
-  #       the end of get_sandbox() without further processing
+  #       so it doesn't make much sense to merge by "items". also both get
+  #       transformed into dict at the end of get_sandbox() without further processing
   "items": {"mounts", "chmod", "dbus.rules.*", "dbus.user.rules.*", "dbus.system.rules.*"},
   # TODO: wouldn't "override" or "overwrite" be a better name than "literal"?
   "literal": BWRAP_FLAGS
@@ -88,8 +91,8 @@ def try_load_sandbox(name: str) -> dict|None:
         Path(name),
         Path(f"{name}.yml"),
         Path(f"{name}.yaml"),
-        Path.home() / ".config" / "sandbox" / f"{name}.yml",
-        Path.home() / ".config" / "sandbox" / f"{name}.yaml",
+        SB_CONFIG / f"{name}.yml",
+        SB_CONFIG / f"{name}.yaml",
     )
     for p in candidate_paths:
         if p.exists():
@@ -124,7 +127,7 @@ def merge(a: dict[str, Any], b: dict[str, Any], path: list[str]=[]) -> dict[str,
                 left = a.get(k, {})
                 right = b.get(k, {})
                 res[k] = (list(left.items()) if isinstance(left, dict) else left) + \
-                    (list(right.items()) if isinstance(right, dict) else right)
+                         (list(right.items()) if isinstance(right, dict) else right)
             case "dict":
                 res[k] = merge(a.get(k, {}), b.get(k, {}), key_path)
             case "literal":
@@ -244,6 +247,10 @@ def pipefd(data: bytes) -> str:
     else:
         os.close(pw)
         return str(pr)
+
+
+def pipefd_args(args: list[str]) -> str:
+    return pipefd("\0".join(args).encode("utf-8"))
 
 
 # resolve bwrap flags from given sandbox config
@@ -399,10 +406,11 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     proxy_dir: str = f"{runtime_dir}/xdg-dbus-proxy/bwrap-{os.getpid()}"
 
     unix_path_prefix: str = "unix:path="
-    dbus_session_address: str = os.environ.get("DBUS_SESSION_BUS_ADDRESS", f"{unix_path_prefix}/run/user/{os.getuid()}/bus")
+    dbus_sess_bus_env_var: str = "DBUS_SESSION_BUS_ADDRESS"
+    dbus_session_address: str = os.environ.get(dbus_sess_bus_env_var, f"{unix_path_prefix}/run/user/{os.getuid()}/bus")
     buses: Sequence[tuple[str,str,str|None]] = (
         ("system", f"{unix_path_prefix}/run/dbus/system_bus_socket", None),
-        ("user", dbus_session_address, "DBUS_SESSION_BUS_ADDRESS"),
+        ("user", dbus_session_address, dbus_sess_bus_env_var),
     )
 
     proxy_bwrap_args: list[str] = ["--bind", proxy_dir, proxy_dir]
@@ -435,7 +443,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
         debug_object("dbus proxy sandbox", proxy_sb)
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
-        dbus_proxy_args = ["bwrap", "--args", pipefd("\0".join(proxy_bwrap_args).encode("utf-8"))] + dbus_proxy_args
+        dbus_proxy_args = ["bwrap", "--args", pipefd_args(proxy_bwrap_args)] + dbus_proxy_args
         LOGGER.debug("bwrap args for xdg-dbus-proxy for bus: %s", shlex.join(proxy_bwrap_args))
 
     if os.fork() == 0:
@@ -472,7 +480,7 @@ args: argparse.Namespace = parser.parse_args()
 if args.log_level:
     logging.basicConfig(stream=sys.stdout, level=getattr(logging, args.log_level.upper()), force=True)
 
-for global_path in (Path.home() / ".config" / "sandbox.yaml", Path.home() / ".config" / "sandbox.yml"):
+for global_path in (CONFIG_HOME / "sandbox.yaml", CONFIG_HOME / "sandbox.yml"):
     if global_path.exists():
         GLOBAL_SANDBOXES = load_sandboxes_file(global_path)
 
@@ -513,11 +521,13 @@ if args.autoload:
         CONFIGS.append(sb)
 
 if not args.no_match:
-    for sb in GLOBAL_SANDBOXES:
-        if EXECUTABLE_NAME in sb.get("matches", ()) and sb not in CONFIGS:
-            CONFIGS.append(sb)
+    for gs in GLOBAL_SANDBOXES:
+        if EXECUTABLE_NAME in gs.get("matches", ()) and gs not in CONFIGS:
+            CONFIGS.append(gs)
 
-if not CONFIGS and not args.no_default:
+if not CONFIGS:
+    if args.no_default:
+        raise Exception(f"no matching sandbox config(s) found, and defaulting to [{args.default_sandbox}] sandbox is disallowed")
     CONFIGS.append(load_sandbox(args.default_sandbox))
 
 debug_object("configs", CONFIGS)
@@ -532,7 +542,8 @@ DEFAULT_VARS: dict[str, str|int] = {
 SB = get_sandbox(merge_sandboxes(CONFIGS))
 debug_object("sandbox", SB)
 
-# TODO: consider removing this option:
+# TODO: consider removing this option; although this allows us to use matches: key
+#       in config to selectively disable sandboxing for select commands...
 if SB.get("disableSandbox"):
     os.execlp(args.executable, args.executable, *args.args)
 
@@ -542,7 +553,7 @@ BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS.extend(DBUS_PROXY_ARGS)
 
 LOGGER.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [args.executable or EXECUTABLE_NAME] + args.args))
-os.execlp("bwrap", "bwrap", "--args", pipefd("\0".join(BWRAP_ARGS).encode("utf-8")),
+os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS),
           args.executable or EXECUTABLE_NAME, *args.args)
 
 # TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten

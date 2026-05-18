@@ -22,6 +22,10 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
   - more related projects in [crabjail's readme](https://codeberg.org/crabjail/crabjail#related-projects)
 - [opensnitch](https://github.com/evilsocket/opensnitch)
 - [bubblejail](https://github.com/igo95862/bubblejail)
+- [matchlock](https://github.com/jingkaihe/matchlock)
+  - isolates AI workloads using firecracker
+- [gondolin](https://github.com/earendil-works/gondolin)
+  - another agent isolation using micro-VMs (qemu by default)
 https://github.com/windtf/wireproxy
 https://github.com/capnspacehook/egress-eddie
 
