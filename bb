@@ -305,66 +305,66 @@ def get_bwrap_args(sb: dict) -> list[str]:
     args: list[str] = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f)]
     for o in BWRAP_OPTIONS:
         if (v := sb.get(o)) not in (False, None):
-            args.extend((f"--{bwrap_name(o)}", format_option_value(o, v)))
+            args += (f"--{bwrap_name(o)}", format_option_value(o, v))
     for o in BWRAP_LIST_OPTIONS:
         for v in sb.get(o, ()):
             if v not in (False, None):
-                args.extend((f"--{bwrap_name(o)}", format_option_value(o, v)))
-    args.extend(arg.format(**format_vars) for arg in sb.get("extraArgs", ()))
+                args += (f"--{bwrap_name(o)}", format_option_value(o, v))
+    args += (arg.format(**format_vars) for arg in sb.get("extraArgs", ()))
     for e in sb["envUnset"]:
-        args.extend(("--unsetenv", e))
+        args += ("--unsetenv", e)
     for k, v in sb["env"].items():
-        args.extend(("--setenv", k, v))
+        args += ("--setenv", k, v)
 
     # note dest_path is in the sandbox
     for dest_path, mount in sorted(sb["mounts"].items()):
         if mount in ("proc", "dev", "tmpfs", "mqueue", "dir"):
             # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
             #       key formatting was already done in the end of get_sandbox()?
-            args.extend((f"--{mount}", dest_path.format(**format_vars)))
+            args += (f"--{mount}", dest_path.format(**format_vars))
         elif mount in ("bind", "bind-try", "ro-bind", "ro-bind-try", "dev-bind", "dev-bind-try"):  # convenience, SRC & DEST will be the same
             # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
             #       key formatting was already done in the end of get_sandbox()?
             p = dest_path.format(**format_vars)
-            args.extend((f"--{mount}", p, p))
+            args += (f"--{mount}", p, p)
         elif isinstance(mount, dict):
             if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
                 if (perms := tmpfs.get("perms")) is not None:
-                    args.extend(("--perms", str(perms)))
+                    args += ("--perms", str(perms))
                 if (size := tmpfs.get("size")) is not None:
-                    args.extend(("--size", str(size)))
-                args.extend(("--tmpfs", dest_path))
+                    args += ("--size", str(size))
+                args += ("--tmpfs", dest_path)
             elif (dir := mount.get("dir")) is not None:  # { dir: { perms?: number }}
                 if (perms := dir.get("perms")) is not None:
-                    args.extend(("--perms", str(perms)))
-                args.extend(("--dir", dest_path))
+                    args += ("--perms", str(perms))
+                args += ("--dir", dest_path)
             elif (symlink := mount.get("symlink")) is not None:  # { symlink: string }
-                args.extend(("--symlink", symlink.format(**format_vars), dest_path))
+                args += ("--symlink", symlink.format(**format_vars), dest_path)
             elif (bind := mount.get("bind")) is not None:  # { bind: { path: string; ro?: boolean; dev?: boolean; try?: boolean, create?: boolean }}
                 prefix = "dev-" if bind.get("dev") else "ro-" if bind.get("ro") else ""
                 suffix = "-try" if bind.get("try") else ""
                 src_path = os.path.expanduser(bind.get("path", dest_path).format(**format_vars))
                 if bind.get("create"):
                     os.makedirs(src_path, exist_ok=True)
-                args.extend((f"--{prefix}bind{suffix}", src_path, dest_path))
+                args += (f"--{prefix}bind{suffix}", src_path, dest_path)
             elif (fd := mount.get("fd")) is not None:  # { fd: { fd: number; ro?: boolean }}
-                args.extend(("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"])))
+                args += ("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"]))
             elif (file := mount.get("file")) is not None:  # { file: DataSource & { perms?: number }}
                 if (perms := file.get("perms")) is not None:
-                    args.extend(("--perms", str(perms)))
-                args.extend(("--file", format_datasource_value(file), dest_path))
+                    args += ("--perms", str(perms))
+                args += ("--file", format_datasource_value(file), dest_path)
             elif (data := mount.get("data")) is not None:  # { data: DataSource & { ro?: boolean; perms?: number }}
                 if (perms := data.get("perms")) is not None:
-                    args.extend(("--perms", str(perms)))
-                args.extend(("--ro-bind-data" if data.get("ro") else "--bind-data", format_datasource_value(data), dest_path))
+                    args += ("--perms", str(perms))
+                args += ("--ro-bind-data" if data.get("ro") else "--bind-data", format_datasource_value(data), dest_path)
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
                 for lower in overlay["lower"]:
-                    args.extend(("--overlay-src", lower.format(**format_vars)))
+                    args += ("--overlay-src", lower.format(**format_vars))
                 mode = overlay.get("mode", "rw" if "upper" in overlay and "work" in overlay else "tmp")
                 if mode == "rw":
-                    args.extend(("--overlay", overlay["upper"], overlay["work"], dest_path))  # i.e. --overlay RWSRC WORKDIR DEST
+                    args += ("--overlay", overlay["upper"], overlay["work"], dest_path)  # i.e. --overlay RWSRC WORKDIR DEST
                 else:
-                    args.extend((f"--{mode}-overlay", dest_path))
+                    args += (f"--{mode}-overlay", dest_path)
             else:
                 raise Exception(f"invalid mount value: {repr(mount)}")
         else:
@@ -372,7 +372,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
     # TODO: is there need to do path.format(**format_vars) anymore, given
     #       key formatting was already done in the end of get_sandbox()?
     for path, mode in sorted(sb["chmod"].items()):
-        args.extend(("--chmod", str(mode), path.format(**format_vars)))
+        args += ("--chmod", str(mode), path.format(**format_vars))
     return args
 
 
@@ -385,12 +385,12 @@ def get_dbus_proxy_args(dbus: dict, bus_name: str) -> list[str]:
         args.append("--sloppy-names")
 
     policies: dict[str, str] = {**dbus.get("policies", {}), **b.get("policies", {})}
-    args.extend(f"--{policy}={name}" for name, policy in policies.items())
+    args += (f"--{policy}={name}" for name, policy in policies.items())
 
     for rule_type in ("broadcast", "call"):
         ruleset: list[tuple[str, str]] = dbus.get("rules", {}).get(rule_type, []) + \
                                          b.get("rules", {}).get(rule_type, [])
-        args.extend(f"--{rule_type}={name}={rule}" for name, rule in ruleset)
+        args += (f"--{rule_type}={name}={rule}" for name, rule in ruleset)
     return args
 
 
@@ -419,15 +419,15 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     for bus, address, addr_env in buses:
         if bus not in dbus:
             continue
-        dbus_proxy_args.extend((address, f"{proxy_dir}/{bus}", "--filter"))
+        dbus_proxy_args += (address, f"{proxy_dir}/{bus}", "--filter")
         bus_args: list[str] = get_dbus_proxy_args(dbus, bus)
-        dbus_proxy_args.extend(bus_args)
+        dbus_proxy_args += bus_args
 
         addr_path = address.removeprefix(unix_path_prefix)
-        proxy_bwrap_args.extend(("--bind", addr_path, addr_path))
-        cmd_bwrap_args.extend(("--bind", f"{proxy_dir}/{bus}", addr_path))
+        proxy_bwrap_args += ("--bind", addr_path, addr_path)
+        cmd_bwrap_args += ("--bind", f"{proxy_dir}/{bus}", addr_path)
         if addr_env:
-            cmd_bwrap_args.extend(("--setenv", addr_env, address))
+            cmd_bwrap_args += ("--setenv", addr_env, address)
 
     if not dbus_proxy_args:  # sanity
         prefix = f"[{sb['name']}] " if "name" in sb else ""
@@ -482,7 +482,7 @@ if ARGS.log_level:
 
 for global_path in (CONFIG_HOME / "sandbox.yaml", CONFIG_HOME / "sandbox.yml"):
     if global_path.exists():
-        GLOBAL_SANDBOXES.extend(load_sandboxes_file(global_path))
+        GLOBAL_SANDBOXES += load_sandboxes_file(global_path)
 
 CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a single sandbox config
 for source_type, source_data in CONFIGS_SOURCES:
@@ -494,7 +494,7 @@ for source_type, source_data in CONFIGS_SOURCES:
         case "json":
             CONFIGS.append(json.loads(source_data))
         case "file":
-            CONFIGS.extend(load_sandboxes_file(source_data))
+            CONFIGS += load_sandboxes_file(source_data)
         case "set":
             k, v = source_data.split("=", 1)
             k = re.sub(r"^\$", "env.", re.sub(r"^:", "vars.", k))
@@ -550,7 +550,7 @@ if SB.get("disableSandbox"):
 DBUS_PROXY_ARGS: list[str] = setup_dbus_proxy(SB)
 
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
-BWRAP_ARGS.extend(DBUS_PROXY_ARGS)
+BWRAP_ARGS += DBUS_PROXY_ARGS
 
 LOGGER.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [ARGS.executable or EXECUTABLE_NAME] + ARGS.args))
 os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS),
