@@ -475,14 +475,14 @@ parser.add_argument("-D", "--no-default", action="store_true")
 parser.add_argument("--default-sandbox", action="store", default="default")
 parser.add_argument("executable", nargs="?")
 parser.add_argument("args", nargs=argparse.REMAINDER)
-args: argparse.Namespace = parser.parse_args()
+ARGS: argparse.Namespace = parser.parse_args()
 
-if args.log_level:
-    logging.basicConfig(stream=sys.stdout, level=getattr(logging, args.log_level.upper()), force=True)
+if ARGS.log_level:
+    logging.basicConfig(stream=sys.stdout, level=getattr(logging, ARGS.log_level.upper()), force=True)
 
 for global_path in (CONFIG_HOME / "sandbox.yaml", CONFIG_HOME / "sandbox.yml"):
     if global_path.exists():
-        GLOBAL_SANDBOXES = load_sandboxes_file(global_path)
+        GLOBAL_SANDBOXES.extend(load_sandboxes_file(global_path))
 
 CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a single sandbox config
 for source_type, source_data in CONFIGS_SOURCES:
@@ -498,7 +498,7 @@ for source_type, source_data in CONFIGS_SOURCES:
         case "set":
             k, v = source_data.split("=", 1)
             k = re.sub(r"^\$", "env.", re.sub(r"^:", "vars.", k))
-            v = json.loads(v) if v and (v[0] in '"[{'or v in ("true", "false", "null")) else v
+            v = json.loads(v) if v and (v[0] in '"[{' or v in ("true", "false", "null")) else v
             obj = {}
             cur = obj
             for is_array, p, end in re.findall(r'(?:^|\.)(@?)("[^"=]+"|[^".=]+)(=$)?', f"{k}="):
@@ -514,47 +514,47 @@ for source_type, source_data in CONFIGS_SOURCES:
         case _:
             raise NotImplementedError
 
-EXECUTABLE_NAME: str = os.path.basename(args.executable or os.environ.get("SHELL", "sh"))
+EXECUTABLE_NAME: str = os.path.basename(ARGS.executable or os.environ.get("SHELL", "sh"))
 
-if args.autoload:
+if ARGS.autoload:
     if (sb := try_load_sandbox(EXECUTABLE_NAME)) and sb not in CONFIGS:
         CONFIGS.append(sb)
 
-if not args.no_match:
+if not ARGS.no_match:
     for gs in GLOBAL_SANDBOXES:
         if EXECUTABLE_NAME in gs.get("matches", ()) and gs not in CONFIGS:
             CONFIGS.append(gs)
 
 if not CONFIGS:
-    if args.no_default:
-        raise Exception(f"no matching sandbox config(s) found, and defaulting to [{args.default_sandbox}] sandbox is disallowed")
-    CONFIGS.append(load_sandbox(args.default_sandbox))
+    if ARGS.no_default:
+        raise Exception(f"no matching sandbox config(s) found, and defaulting to [{ARGS.default_sandbox}] sandbox is disallowed")
+    CONFIGS.append(load_sandbox(ARGS.default_sandbox))
 
 debug_object("configs", CONFIGS)
 
 DEFAULT_VARS: dict[str, str|int] = {
     "pid": os.getpid(),
     "cwd": os.getcwd(),
-    "executable": args.executable,
+    "executable": ARGS.executable,
     "name": EXECUTABLE_NAME,
 }
 
-SB = get_sandbox(merge_sandboxes(CONFIGS))
+SB: dict = get_sandbox(merge_sandboxes(CONFIGS))
 debug_object("sandbox", SB)
 
 # TODO: consider removing this option; although this allows us to use matches: key
 #       in config to selectively disable sandboxing for select commands...
 if SB.get("disableSandbox"):
-    os.execlp(args.executable, args.executable, *args.args)
+    os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
 
 DBUS_PROXY_ARGS: list[str] = setup_dbus_proxy(SB)
 
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS.extend(DBUS_PROXY_ARGS)
 
-LOGGER.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [args.executable or EXECUTABLE_NAME] + args.args))
+LOGGER.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [ARGS.executable or EXECUTABLE_NAME] + ARGS.args))
 os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS),
-          args.executable or EXECUTABLE_NAME, *args.args)
+          ARGS.executable or EXECUTABLE_NAME, *ARGS.args)
 
 # TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten
 # TODO: consider renaming 'path' key in mount config to 'src'
