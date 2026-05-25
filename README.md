@@ -43,6 +43,7 @@ https://github.com/capnspacehook/egress-eddie
   using its `TypeAdapter`;
 - why do we use camel-case in config only having to convert it to kebab
   used by bwrap via bwrap_name()? would make everyone's lives easier by using kebab everywhere.
-- do we want to add `--json-status-fd FD` (or older `--info-fd FD` alternative)
-  to bwrap?
+- do we want to add `--json-status-fd FD` (e.g. replace or add in addition to
+  existing `--info-fd FD`) to bwrap?
+- how to make `xdg-dbus-proxy` work if it's _not_ sandboxed?
 

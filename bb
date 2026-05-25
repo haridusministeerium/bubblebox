@@ -23,6 +23,7 @@ LOGGER: logging.Logger = logging.getLogger()
 CONFIG_HOME: Path = Path(os.environ.get("XDG_CONFIG_HOME", os.environ["HOME"] + "/.config"))
 RUNTIME_DIR: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 SB_CONFIG: Path = CONFIG_HOME / "sandbox"
+APP_BASE = "org.bubblebox"  # note app name needs to contain '.' in it for portals to work!
 
 SANDBOXES_CACHE: dict[str, dict] = {}
 GLOBAL_SANDBOXES: list[dict] = []
@@ -303,6 +304,11 @@ def get_bwrap_args(sb: dict) -> list[str]:
             return pipefd(content)
         raise NotImplementedError
 
+    def get_perms(perms: str|int) -> tuple[str,str]:
+        if isinstance(perms, str) and perms.startswith("0o"):
+            perms = f"0{int(perms, 0):o}"
+        return "--perms", str(perms)
+
     format_vars = {**sb["vars"], "env": {**os.environ, **sb["env"]}}
     args: list[str] = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f)]
     for o in BWRAP_OPTIONS:
@@ -332,13 +338,13 @@ def get_bwrap_args(sb: dict) -> list[str]:
         elif isinstance(mount, dict):
             if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
                 if (perms := tmpfs.get("perms")) is not None:
-                    args += ("--perms", str(perms))
+                    args += get_perms(perms)
                 if (size := tmpfs.get("size")) is not None:
                     args += ("--size", str(size))
                 args += ("--tmpfs", dest_path)
             elif (dir := mount.get("dir")) is not None:  # { dir: { perms?: number }}
                 if (perms := dir.get("perms")) is not None:
-                    args += ("--perms", str(perms))
+                    args += get_perms(perms)
                 args += ("--dir", dest_path)
             elif (symlink := mount.get("symlink")) is not None:  # { symlink: string }
                 args += ("--symlink", symlink.format(**format_vars), dest_path)
@@ -353,11 +359,11 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 args += ("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"]))
             elif (file := mount.get("file")) is not None:  # { file: DataSource & { perms?: number }}
                 if (perms := file.get("perms")) is not None:
-                    args += ("--perms", str(perms))
+                    args += get_perms(perms)
                 args += ("--file", format_datasource_value(file), dest_path)
             elif (data := mount.get("data")) is not None:  # { data: DataSource & { ro?: boolean; perms?: number }}
                 if (perms := data.get("perms")) is not None:
-                    args += ("--perms", str(perms))
+                    args += get_perms(perms)
                 args += ("--ro-bind-data" if data.get("ro") else "--bind-data", format_datasource_value(data), dest_path)
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
                 for lower in overlay["lower"]:
@@ -438,15 +444,16 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     os.makedirs(proxy_dir, exist_ok=True)
     pr, pw = os.pipe2(0)
     dbus_proxy_args = ["xdg-dbus-proxy", f"--fd={pw}"] + dbus_proxy_args
-    LOGGER.debug("proxy args for dbus proxy: %r\n", shlex.join(dbus_proxy_args))
+    LOGGER.debug("proxy args for dbus proxy: %s\n", shlex.join(dbus_proxy_args))
 
     # if 'dbus.sandbox' defined, then it means xdg-dbus-proxy itself is to be ran in bwrap as well:
+    # TODO: as of May '26, portals do not work if x-d-p runs unsandboxed:
     if proxy_sb := dbus.get("sandbox"):
         proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
         debug_object("dbus proxy sandbox", proxy_sb)
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
-        dbus_proxy_args = ["bwrap", "--args", pipefd_args(proxy_bwrap_args)] + dbus_proxy_args
-        LOGGER.debug("bwrap args for xdg-dbus-proxy for bus: %s\n", shlex.join(proxy_bwrap_args))
+        dbus_proxy_args = ["bwrap", "--args", pipefd_args(proxy_bwrap_args), "--"] + dbus_proxy_args
+        LOGGER.debug("bwrap args for xdg-dbus-proxy: %s\n", shlex.join(proxy_bwrap_args))
 
     if os.fork() == 0:
         os.close(pr)
@@ -543,14 +550,13 @@ if not CONFIGS:
 
 debug_object("configs", CONFIGS)
 
-INSTANCE_ID: str = f"bwrap-{os.getpid()}"
-DEFAULT_VARS: dict[str, str|int] = {
-    "pid": os.getpid(),
+INSTANCE_ID: str = f"{APP_BASE}-{os.getpid()}"
+DEFAULT_VARS: dict[str, str] = {
     "instance_id": INSTANCE_ID,
     "runtime_dir": RUNTIME_DIR,
     "cwd": os.getcwd(),
-    "executable": ARGS.executable,
-    "name": EXECUTABLE_NAME,
+    "executable": ARGS.executable,  # str | None
+    "name": f"{APP_BASE}.{EXECUTABLE_NAME}",
 }
 
 SB: dict = get_sandbox(merge_sandboxes(CONFIGS))
@@ -565,10 +571,10 @@ BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS += get_bwrapinfo_args()
 BWRAP_ARGS += setup_dbus_proxy(SB)
 
+EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
-                                               [ARGS.executable or EXECUTABLE_NAME] + ARGS.args))
-os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS),
-          ARGS.executable or EXECUTABLE_NAME, *ARGS.args)
+                                               ["--", EFFECTIVE_EXEC] + ARGS.args))
+os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS), "--", EFFECTIVE_EXEC, *ARGS.args)
 
 # TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten
 # TODO: consider renaming 'path' key in mount config to 'src'
