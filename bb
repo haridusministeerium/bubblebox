@@ -16,10 +16,12 @@ import re
 import shlex
 import sys
 import yaml
+import fcntl
 
 LOGGER: logging.Logger = logging.getLogger()
 
 CONFIG_HOME: Path = Path(os.environ.get("XDG_CONFIG_HOME", os.environ["HOME"] + "/.config"))
+RUNTIME_DIR: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 SB_CONFIG: Path = CONFIG_HOME / "sandbox"
 
 SANDBOXES_CACHE: dict[str, dict] = {}
@@ -371,6 +373,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
             raise Exception(f"invalid mount (of type {type(mount)}) value: {repr(mount)}")
     # TODO: is there need to do path.format(**format_vars) anymore, given
     #       key formatting was already done in the end of get_sandbox()?
+    # TODO: is sorting for chmod needed?
     for path, mode in sorted(sb["chmod"].items()):
         args += ("--chmod", str(mode), path.format(**format_vars))
     return args
@@ -402,8 +405,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
             raise Exception("empty [dbus] key/block not allowed")
         return []  # no dbus proxies configured, bail
 
-    runtime_dir: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    proxy_dir: str = f"{runtime_dir}/xdg-dbus-proxy/bwrap-{os.getpid()}"
+    proxy_dir: str = f"{RUNTIME_DIR}/xdg-dbus-proxy/{INSTANCE_ID}"
 
     unix_path_prefix: str = "unix:path="
     dbus_sess_bus_env_var: str = "DBUS_SESSION_BUS_ADDRESS"
@@ -436,7 +438,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     os.makedirs(proxy_dir, exist_ok=True)
     pr, pw = os.pipe2(0)
     dbus_proxy_args = ["xdg-dbus-proxy", f"--fd={pw}"] + dbus_proxy_args
-    LOGGER.debug("proxy args for dbus proxy: %r", shlex.join(dbus_proxy_args))
+    LOGGER.debug("proxy args for dbus proxy: %r\n", shlex.join(dbus_proxy_args))
 
     # if 'dbus.sandbox' defined, then it means xdg-dbus-proxy itself is to be ran in bwrap as well:
     if proxy_sb := dbus.get("sandbox"):
@@ -444,7 +446,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         debug_object("dbus proxy sandbox", proxy_sb)
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
         dbus_proxy_args = ["bwrap", "--args", pipefd_args(proxy_bwrap_args)] + dbus_proxy_args
-        LOGGER.debug("bwrap args for xdg-dbus-proxy for bus: %s", shlex.join(proxy_bwrap_args))
+        LOGGER.debug("bwrap args for xdg-dbus-proxy for bus: %s\n", shlex.join(proxy_bwrap_args))
 
     if os.fork() == 0:
         os.close(pr)
@@ -453,6 +455,15 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         os.close(pw)
         assert os.read(pr, 1) == b"x"
         return ["--sync-fd", str(pr)] + cmd_bwrap_args
+
+
+def get_bwrapinfo_args() -> list[str]:
+    global INFO_FD  # so it's not gc-d before bwrap is launched/done
+    info_path = f"{RUNTIME_DIR}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
+    os.makedirs(os.path.dirname(info_path), exist_ok=True)
+    INFO_FD = open(info_path, "w")
+    fcntl.fcntl(INFO_FD, fcntl.F_SETFD, 0)
+    return ["--info-fd", str(INFO_FD.fileno())]
 
 
 def debug_object(label: str, obj: object) -> None:
@@ -532,8 +543,11 @@ if not CONFIGS:
 
 debug_object("configs", CONFIGS)
 
+INSTANCE_ID: str = f"bwrap-{os.getpid()}"
 DEFAULT_VARS: dict[str, str|int] = {
     "pid": os.getpid(),
+    "instance_id": INSTANCE_ID,
+    "runtime_dir": RUNTIME_DIR,
     "cwd": os.getcwd(),
     "executable": ARGS.executable,
     "name": EXECUTABLE_NAME,
@@ -547,12 +561,12 @@ debug_object("sandbox", SB)
 if SB.get("disableSandbox"):
     os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
 
-DBUS_PROXY_ARGS: list[str] = setup_dbus_proxy(SB)
-
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
-BWRAP_ARGS += DBUS_PROXY_ARGS
+BWRAP_ARGS += get_bwrapinfo_args()
+BWRAP_ARGS += setup_dbus_proxy(SB)
 
-LOGGER.debug("bwrap command: %s", shlex.join(["bwrap"] + BWRAP_ARGS + [ARGS.executable or EXECUTABLE_NAME] + ARGS.args))
+LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
+                                               [ARGS.executable or EXECUTABLE_NAME] + ARGS.args))
 os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS),
           ARGS.executable or EXECUTABLE_NAME, *ARGS.args)
 

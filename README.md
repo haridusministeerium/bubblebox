@@ -26,6 +26,9 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
   - isolates AI workloads using firecracker
 - [gondolin](https://github.com/earendil-works/gondolin)
   - another agent isolation using micro-VMs (qemu by default)
+- [one sandboxing blog post](https://www.standingpad.org/posts/2023/08/sandboxing-time/)
+  - discovered form the main gist thread discussing xdg portals starting from
+    [here](https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5402392#gistcomment-5402392)
 https://github.com/windtf/wireproxy
 https://github.com/capnspacehook/egress-eddie
 
@@ -40,4 +43,6 @@ https://github.com/capnspacehook/egress-eddie
   using its `TypeAdapter`;
 - why do we use camel-case in config only having to convert it to kebab
   used by bwrap via bwrap_name()? would make everyone's lives easier by using kebab everywhere.
+- do we want to add `--json-status-fd FD` (or older `--info-fd FD` alternative)
+  to bwrap?
 
