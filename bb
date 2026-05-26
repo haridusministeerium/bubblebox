@@ -20,9 +20,9 @@ import fcntl
 
 LOGGER: logging.Logger = logging.getLogger()
 
-CONFIG_HOME: Path = Path(os.environ.get("XDG_CONFIG_HOME", os.environ["HOME"] + "/.config"))
-RUNTIME_DIR: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-SB_CONFIG: Path = CONFIG_HOME / "sandbox"
+XDG_CONFIG: Path = Path(os.environ.get("XDG_CONFIG_HOME", os.environ["HOME"] + "/.config"))
+XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+SB_CONFIG: Path = XDG_CONFIG / "sandbox"
 APP_BASE = "org.bubblebox"  # note app name needs to contain '.' in it for portals to work!
 
 SANDBOXES_CACHE: dict[str, dict] = {}
@@ -411,7 +411,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
             raise Exception("empty [dbus] key/block not allowed")
         return []  # no dbus proxies configured, bail
 
-    proxy_dir: str = f"{RUNTIME_DIR}/xdg-dbus-proxy/{INSTANCE_ID}"
+    proxy_dir: str = f"{XDG_RUNTIME}/xdg-dbus-proxy/{INSTANCE_ID}"
 
     unix_path_prefix: str = "unix:path="
     dbus_sess_bus_env_var: str = "DBUS_SESSION_BUS_ADDRESS"
@@ -466,7 +466,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
 
 def get_bwrapinfo_args() -> list[str]:
     global INFO_FD  # so it's not gc-d before bwrap is launched/done
-    info_path = f"{RUNTIME_DIR}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
+    info_path = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
     os.makedirs(os.path.dirname(info_path), exist_ok=True)
     INFO_FD = open(info_path, "w")
     fcntl.fcntl(INFO_FD, fcntl.F_SETFD, 0)
@@ -498,7 +498,7 @@ ARGS: argparse.Namespace = parser.parse_args()
 if ARGS.log_level:
     logging.basicConfig(stream=sys.stdout, level=getattr(logging, ARGS.log_level.upper()), force=True)
 
-for global_path in (CONFIG_HOME / "sandbox.yaml", CONFIG_HOME / "sandbox.yml"):
+for global_path in (XDG_CONFIG / "sandbox.yaml", XDG_CONFIG / "sandbox.yml"):
     if global_path.exists():
         GLOBAL_SANDBOXES += load_sandboxes_file(global_path)
 
@@ -553,7 +553,8 @@ debug_object("configs", CONFIGS)
 INSTANCE_ID: str = f"{APP_BASE}-{os.getpid()}"
 DEFAULT_VARS: dict[str, str] = {
     "instance_id": INSTANCE_ID,
-    "runtime_dir": RUNTIME_DIR,
+    "xdg_runtime": XDG_RUNTIME,
+    "xdg_config": str(XDG_CONFIG),
     "cwd": os.getcwd(),
     "executable": ARGS.executable,  # str | None
     "name": f"{APP_BASE}.{EXECUTABLE_NAME}",
