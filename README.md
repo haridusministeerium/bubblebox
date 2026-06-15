@@ -7,6 +7,8 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 
 # see also
 
+- [sbx](https://github.com/cauldrondevelopmentllc/sbx)
+  - another solution deriving from @sloonz's gist
 - [landlock](https://github.com/landlock-lsm) - different from
   bubblewrap/firejail -- doesn't use namespaces
   - [island](https://github.com/landlock-lsm/island) - frontend by landlock

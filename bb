@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from typing import Any
 import platform
 import pprint
@@ -72,7 +72,7 @@ MERGE_POLICIES: dict[str, set[str]] = {
 
 def tagged_append(tag: str, dest: list[tuple[str,str]]):
     class TaggedAppend(argparse.Action):
-        def __call__(self, parser, ns, values, option_string: str|None=None):
+        def __call__(self, parser, ns, values, option_string: str|None=None) -> None:
             dest.append((tag, values))
     return TaggedAppend
 
@@ -90,7 +90,7 @@ def load_sandboxes_file(path: Path|str, default_name: str|None=None) -> list[dic
 def try_load_sandbox(name: str) -> dict|None:
     if name in SANDBOXES_CACHE:
         return SANDBOXES_CACHE[name]
-    candidate_paths: Sequence[Path] = (
+    candidate_paths: tuple[Path, ...] = (
         Path(name),
         Path(f"{name}.yml"),
         Path(f"{name}.yaml"),
@@ -304,7 +304,9 @@ def get_bwrap_args(sb: dict) -> list[str]:
             return pipefd(content)
         raise NotImplementedError
 
-    def get_perms(perms: str|int) -> tuple[str,str]:
+    def get_perms(data: dict) -> tuple[str, ...]:
+        if (perms := data.get("perms")) is None:
+            return ()
         if isinstance(perms, str) and perms.startswith("0o"):
             perms = f"0{int(perms, 0):o}"
         return "--perms", str(perms)
@@ -337,14 +339,12 @@ def get_bwrap_args(sb: dict) -> list[str]:
             args += (f"--{mount}", p, p)
         elif isinstance(mount, dict):
             if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
-                if (perms := tmpfs.get("perms")) is not None:
-                    args += get_perms(perms)
+                args += get_perms(tmpfs)
                 if (size := tmpfs.get("size")) is not None:
                     args += ("--size", str(size))
                 args += ("--tmpfs", dest_path)
             elif (dir := mount.get("dir")) is not None:  # { dir: { perms?: number }}
-                if (perms := dir.get("perms")) is not None:
-                    args += get_perms(perms)
+                args += get_perms(dir)
                 args += ("--dir", dest_path)
             elif (symlink := mount.get("symlink")) is not None:  # { symlink: string }
                 args += ("--symlink", symlink.format(**format_vars), dest_path)
@@ -352,19 +352,18 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 prefix = "dev-" if bind.get("dev") else "ro-" if bind.get("ro") else ""
                 suffix = "-try" if bind.get("try") else ""
                 src_path = os.path.expanduser(bind.get("path", dest_path).format(**format_vars))
-                if bind.get("create"):
+                if bind.get("create") is True:
                     os.makedirs(src_path, exist_ok=True)
                 args += (f"--{prefix}bind{suffix}", src_path, dest_path)
             elif (fd := mount.get("fd")) is not None:  # { fd: { fd: number; ro?: boolean }}
                 args += ("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"]))
             elif (file := mount.get("file")) is not None:  # { file: DataSource & { perms?: number }}
-                if (perms := file.get("perms")) is not None:
-                    args += get_perms(perms)
+                args += get_perms(file)
                 args += ("--file", format_datasource_value(file), dest_path)
             elif (data := mount.get("data")) is not None:  # { data: DataSource & { ro?: boolean; perms?: number }}
-                if (perms := data.get("perms")) is not None:
-                    args += get_perms(perms)
-                args += ("--ro-bind-data" if data.get("ro") else "--bind-data", format_datasource_value(data), dest_path)
+                args += get_perms(data)
+                args += ("--ro-bind-data" if data.get("ro") else "--bind-data",
+                         format_datasource_value(data), dest_path)
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
                 for lower in overlay["lower"]:
                     args += ("--overlay-src", lower.format(**format_vars))
@@ -416,7 +415,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
     unix_path_prefix: str = "unix:path="
     dbus_sess_bus_env_var: str = "DBUS_SESSION_BUS_ADDRESS"
     dbus_session_address: str = os.environ.get(dbus_sess_bus_env_var, f"{unix_path_prefix}/run/user/{os.getuid()}/bus")
-    buses: Sequence[tuple[str,str,str|None]] = (
+    buses: tuple[tuple[str,str,str|None], ...] = (
         ("system", f"{unix_path_prefix}/run/dbus/system_bus_socket", None),
         ("user", dbus_session_address, dbus_sess_bus_env_var),
     )
@@ -431,7 +430,10 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         bus_args: list[str] = get_dbus_proxy_args(dbus, bus)
         dbus_proxy_args += bus_args
 
-        addr_path = address.removeprefix(unix_path_prefix)
+        addr_path: str = address.removeprefix(unix_path_prefix)
+        if not os.path.exists(addr_path):  # sanity
+            raise Exception(f"{bus} dbus socket [{addr_path}] does not exist")
+
         proxy_bwrap_args += ("--bind", addr_path, addr_path)
         cmd_bwrap_args += ("--bind", f"{proxy_dir}/{bus}", addr_path)
         if addr_env:
@@ -464,13 +466,16 @@ def setup_dbus_proxy(sb: dict) -> list[str]:
         return ["--sync-fd", str(pr)] + cmd_bwrap_args
 
 
-def get_bwrapinfo_args() -> list[str]:
-    global INFO_FD  # so it's not gc-d before bwrap is launched/done
+# for some explanation, see e.g.
+# - https://github.com/ValveSoftware/steam-for-linux/issues/10645#issuecomment-2013609605
+# - https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d#gistcomment-5515250
+def get_bwrapinfo_args() -> tuple[str, str]:
+    global INFO_FD  # so it's not gc-d prematurely
     info_path = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
     os.makedirs(os.path.dirname(info_path), exist_ok=True)
     INFO_FD = open(info_path, "w")
     fcntl.fcntl(INFO_FD, fcntl.F_SETFD, 0)
-    return ["--info-fd", str(INFO_FD.fileno())]
+    return "--info-fd", str(INFO_FD.fileno())
 
 
 def debug_object(label: str, obj: object) -> None:
