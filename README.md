@@ -5,8 +5,18 @@ The original version was stolen from [@sloonz's gist](https://gist.github.com/sl
 
 Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubblebox)
 
+
+## Articles/blogs/discussions
+
+- [Let's discuss sandbox isolation](https://www.shayon.dev/post/2026/52/lets-discuss-sandbox-isolation/) - blog post from Feb '26
+
+
 # see also
 
+- [simple-appimage-sandbox](https://github.com/Samueru-sama/simple-appimage-sandbox/)
+  - uses bwrap to sandbox appimages
+- [jai](https://github.com/stanford-scs/jai)
+  - Jail your AI agent
 - [sbx](https://github.com/cauldrondevelopmentllc/sbx)
   - another solution deriving from @sloonz's gist
 - [landlock](https://github.com/landlock-lsm) - different from
@@ -17,7 +27,8 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
   - [sandlock](https://github.com/multikernel/sandlock) - 3rd party rust-based frontend
   - see also [software using landlock](https://wiki.gnoack.org/SoftwareUsingLandlock)
 - [syd](https://gitlab.exherbo.org/sydbox/sydbox)
-  - another alternative to bwrap/firejail et al
+  - another alternative to bwrap/firejail et al;
+    > intends to provide a simple interface over various intricate Linux sandboxing mechanisms such as LandLock, Namespaces, Ptrace, and Seccomp-{BPF,Notify}
 - [google/nsjail](https://github.com/google/nsjail)
 - [google/minijail](https://google.github.io/minijail/)
 - [crablock](https://codeberg.org/crabjail/crablock/)
@@ -31,8 +42,8 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 - [one sandboxing blog post](https://www.standingpad.org/posts/2023/08/sandboxing-time/)
   - discovered form the main gist thread discussing xdg portals starting from
     [here](https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5402392#gistcomment-5402392)
-https://github.com/windtf/wireproxy
-https://github.com/capnspacehook/egress-eddie
+- https://github.com/windtf/wireproxy
+- https://github.com/capnspacehook/egress-eddie
 
 
 ## TODO
