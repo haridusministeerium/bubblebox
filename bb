@@ -575,7 +575,7 @@ if SB.get("disableSandbox"):
 
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS += setup_dbus_proxy(SB)
-BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, meaning we dont want any previous fork()s after this, as they'd duplicate the open files/other resources
+BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, meaning we dont want any previous fork()s after this, as open files & other resources would get duplicated
 
 EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +

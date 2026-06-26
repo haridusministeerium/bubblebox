@@ -9,10 +9,27 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 ## Articles/blogs/discussions
 
 - [Let's discuss sandbox isolation](https://www.shayon.dev/post/2026/52/lets-discuss-sandbox-isolation/) - blog post from Feb '26
+- [one sandboxing blog post](https://www.standingpad.org/posts/2023/08/sandboxing-time/)
+  - discovered form the main gist thread discussing xdg portals starting from
+    [here](https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5402392#gistcomment-5402392)
 
 
 # see also
 
+- [fence](https://github.com/fencesandbox/fence)
+  - lang: go
+  - Network isolation - All outbound blocked by default; allowlist domains via config
+  - Filesystem restrictions - Control read/write access paths
+  - Command blocking - Deny dangerous commands like rm -rf /, git push
+  - SSH Command Filtering - Control which hosts and commands are allowed over SSH
+  - Built-in templates - Pre-configured rulesets for common workflows
+  - Violation monitoring - Real-time logging of blocked requests (-m)
+  - Cross-platform - macOS (sandbox-exec) + Linux (bubblewrap)
+- [syd](https://gitlab.exherbo.org/sydbox/sydbox)
+  - another alternative to bwrap/firejail et al;
+    > intends to provide a simple interface over various intricate Linux sandboxing mechanisms such as LandLock, Namespaces, Ptrace, and Seccomp-{BPF,Notify}
+- [crablock](https://codeberg.org/crabjail/crablock/)
+  - more related projects in [crabjail's readme](https://codeberg.org/crabjail/crabjail#related-projects)
 - [simple-appimage-sandbox](https://github.com/Samueru-sama/simple-appimage-sandbox/)
   - uses bwrap to sandbox appimages
 - [jai](https://github.com/stanford-scs/jai)
@@ -26,22 +43,14 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
   - [landrun](https://github.com/Zouuup/landrun) - 3rd party go-based frontend
   - [sandlock](https://github.com/multikernel/sandlock) - 3rd party rust-based frontend
   - see also [software using landlock](https://wiki.gnoack.org/SoftwareUsingLandlock)
-- [syd](https://gitlab.exherbo.org/sydbox/sydbox)
-  - another alternative to bwrap/firejail et al;
-    > intends to provide a simple interface over various intricate Linux sandboxing mechanisms such as LandLock, Namespaces, Ptrace, and Seccomp-{BPF,Notify}
 - [google/nsjail](https://github.com/google/nsjail)
 - [google/minijail](https://google.github.io/minijail/)
-- [crablock](https://codeberg.org/crabjail/crablock/)
-  - more related projects in [crabjail's readme](https://codeberg.org/crabjail/crabjail#related-projects)
 - [opensnitch](https://github.com/evilsocket/opensnitch)
 - [bubblejail](https://github.com/igo95862/bubblejail)
 - [matchlock](https://github.com/jingkaihe/matchlock)
   - isolates AI workloads using firecracker
 - [gondolin](https://github.com/earendil-works/gondolin)
   - another agent isolation using micro-VMs (qemu by default)
-- [one sandboxing blog post](https://www.standingpad.org/posts/2023/08/sandboxing-time/)
-  - discovered form the main gist thread discussing xdg portals starting from
-    [here](https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5402392#gistcomment-5402392)
 - https://github.com/windtf/wireproxy
 - https://github.com/capnspacehook/egress-eddie
 
@@ -59,4 +68,6 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 - do we want to add `--json-status-fd FD` (e.g. replace or add in addition to
   existing `--info-fd FD`) to bwrap?
 - how to make `xdg-dbus-proxy` work if it's _not_ sandboxed?
+- more of a config/taste question, but is there any point in binding separate
+  `~/.cache`, given we already have private HOME?
 
