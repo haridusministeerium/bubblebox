@@ -49,6 +49,10 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 - [bubblejail](https://github.com/igo95862/bubblejail)
 - [matchlock](https://github.com/jingkaihe/matchlock)
   - isolates AI workloads using firecracker
+  - one interesting feature is the secrets injection:
+    > When your agent calls an API the real credentials are injected in-flight by the host.
+      The sandbox only ever sees a placeholder. Even if the agent is tricked into running
+      something malicious your keys don't leak and there's nowhere for data to go
 - [gondolin](https://github.com/earendil-works/gondolin)
   - another agent isolation using micro-VMs (qemu by default)
 - https://github.com/windtf/wireproxy

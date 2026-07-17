@@ -20,8 +20,13 @@ import fcntl
 
 LOGGER: logging.Logger = logging.getLogger()
 
-XDG_CONFIG: Path = Path(os.environ.get("XDG_CONFIG_HOME", os.environ["HOME"] + "/.config"))
+HOME: str = os.environ["HOME"]
+XDG_CONFIG: Path = Path(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"))
+XDG_DATA: Path = Path(os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"))
+XDG_STATE: Path = Path(os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"))
+XDG_CACHE: Path = Path(os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"))
 XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+
 SB_CONFIG: Path = XDG_CONFIG / "sandbox"
 APP_BASE = "org.bubblebox"  # note app name needs to contain '.' in it for portals to work!
 
@@ -64,8 +69,6 @@ MERGE_POLICIES: dict[str, set[str]] = {
   "dict": {"vars", "env", "dbus", "dbus.sandbox", "dbus.policies",
            "dbus.user.policies", "dbus.system.policies", "dbus.user", "dbus.system",
            "dbus.rules", "dbus.user.rules", "dbus.system.rules"},
-  # TODO: is it intentional we're not merging 'include'? if so, why's that?
-  #       to avoid circular dependencies?
   "discard": {"name", "include"},
 }
 
@@ -326,17 +329,25 @@ def get_bwrap_args(sb: dict) -> list[str]:
     for k, v in sb["env"].items():
         args += ("--setenv", k, v)
 
-    # note dest_path is in the sandbox
+    # note dest_path is on the sandbox side
     for dest_path, mount in sorted(sb["mounts"].items()):
         if mount in ("proc", "dev", "tmpfs", "mqueue", "dir"):
             # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
             #       key formatting was already done in the end of get_sandbox()?
             args += (f"--{mount}", dest_path.format(**format_vars))
-        elif mount in ("bind", "bind-try", "ro-bind", "ro-bind-try", "dev-bind", "dev-bind-try"):  # convenience, SRC & DEST will be the same
-            # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
-            #       key formatting was already done in the end of get_sandbox()?
-            p = dest_path.format(**format_vars)
-            args += (f"--{mount}", p, p)
+        # convenience for when SRC & DEST are the same; note:
+        # - it covers also '-try' or '-create' suffixes;
+        # - the '-create' suffix is our own convention and will be stripped from final flag;
+        #   it creates the SRC dir if id doesn't exist
+        elif isinstance(mount, str) and re.match(r"(ro-|dev-)?bind(-try|-create)?(:|$)", mount):
+            src_path = dest_path
+            if ":" in mount:
+                mount, src_path = mount.split(":", 1)
+                src_path = os.path.expanduser(src_path.format(**format_vars))
+            if mount.endswith("-create"):
+                mount = mount.removesuffix("-create")
+                os.makedirs(src_path, exist_ok=True)
+            args += (f"--{mount}", src_path, dest_path)
         elif isinstance(mount, dict):
             if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
                 args += get_perms(tmpfs)
@@ -560,6 +571,9 @@ DEFAULT_VARS: dict[str, str] = {
     "instance_id": INSTANCE_ID,
     "xdg_runtime": XDG_RUNTIME,
     "xdg_config": str(XDG_CONFIG),
+    "xdg_data": str(XDG_DATA),
+    "xdg_state": str(XDG_STATE),
+    "xdg_cache": str(XDG_CACHE),
     "cwd": os.getcwd(),
     "executable": ARGS.executable,  # str | None
     "name": f"{APP_BASE}.{EXECUTABLE_NAME}",
