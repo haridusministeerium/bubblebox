@@ -25,7 +25,6 @@ XDG_CONFIG: Path = Path(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"))
 XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
 SB_CONFIG: Path = XDG_CONFIG / "sandbox"
-APP_BASE = "org.bubblebox"  # note app name needs to contain '.' in it for portals to work!
 
 SANDBOXES_CACHE: dict[str, dict] = {}
 GLOBAL_SANDBOXES: list[dict] = []
@@ -224,7 +223,7 @@ def get_sandbox(sb: dict) -> dict:
         for parsed, raw in ((vars, raw_vars), (env, raw_env)):
             for k in list(raw.keys()):
                 try:
-                    parsed[k] = raw[k].format(**format_vars)
+                    parsed[k] = expand(raw[k], format_vars)
                     del raw[k]
                     changed = True
                 except KeyError:
@@ -337,7 +336,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
             # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
             #       key formatting was already done in the end of get_sandbox()?
             args += (f"--{mount}", dest_path.format(**format_vars))  # TODO: instead of .format(), invoke our expand()?
-        # convenience for when SRC & DEST are the same; note:
+        # 'bind' convenience for when SRC & DEST are the same; note:
         # - it covers also '-try' or '-create' suffixes;
         # - the '-create' suffix is our own convention and will be stripped from final flag;
         #   it creates the SRC dir if it doesn't exist
@@ -568,6 +567,7 @@ if not CONFIGS:
 
 debug_object("configs", CONFIGS)
 
+APP_BASE: str = "org.bubblebox"  # note app name needs to contain '.' in it for portals to work!
 INSTANCE_ID: str = f"{APP_BASE}-{os.getpid()}"
 DEFAULT_VARS: dict[str, str] = {
     "instance_id": INSTANCE_ID,
@@ -578,9 +578,10 @@ DEFAULT_VARS: dict[str, str] = {
     "xdg_state": os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"),
     "xdg_cache": os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"),
     "cwd": os.getcwd(),
-    "executable": ARGS.executable,  # str | None
-    "exe": EXECUTABLE_NAME,
-    "name": f"{APP_BASE}.{EXECUTABLE_NAME}",
+    "exe_arg": ARGS.executable,  # str | None
+    "exe_name": EXECUTABLE_NAME,  # used to be the old name/fqname value prior to adding mandatory dot for portal
+    "name": EXECUTABLE_NAME,  # alias for "exe_name"
+    "fqname": f"{APP_BASE}.{EXECUTABLE_NAME}",  # fully qualified
 }
 
 SB: dict = get_sandbox(merge_sandboxes(CONFIGS))
