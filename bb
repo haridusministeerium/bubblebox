@@ -22,9 +22,6 @@ LOGGER: logging.Logger = logging.getLogger()
 
 HOME: str = os.environ["HOME"]
 XDG_CONFIG: Path = Path(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"))
-XDG_DATA: Path = Path(os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"))
-XDG_STATE: Path = Path(os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"))
-XDG_CACHE: Path = Path(os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"))
 XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
 SB_CONFIG: Path = XDG_CONFIG / "sandbox"
@@ -71,6 +68,11 @@ MERGE_POLICIES: dict[str, set[str]] = {
            "dbus.rules", "dbus.user.rules", "dbus.system.rules"},
   "discard": {"name", "include"},
 }
+
+
+# TODO: should we also do os.path.expandvars() ?
+def expand(var: str, fmt: dict) -> str:
+    return os.path.expanduser(var.format(**fmt))
 
 
 def tagged_append(tag: str, dest: list[tuple[str,str]]):
@@ -174,9 +176,9 @@ def merge_sandboxes(sandboxes: Iterable[dict]) -> dict:
 # returns enriched sandbox with env/vars/mounts/chmod data
 def get_sandbox(sb: dict) -> dict:
     # Parse vars & env
-    raw_env = {}
-    env = {}
-    env_unset = set()  # env vars to explicitly unset via --unsetenv
+    raw_env: dict = {}
+    env: dict = {}
+    env_unset: set = set()  # env vars to explicitly unset via --unsetenv
 
     for k, v in sb.get("env", {}).items():
         if v is True:  # inherit
@@ -214,9 +216,9 @@ def get_sandbox(sb: dict) -> dict:
     # note format_vars is used to expand our raw_vars & raw_env via python's
     # string.format() method, passing **format_vars as possible values to
     # be expanded into the raw values
-    raw_vars = {**sb.get("vars", {})}
-    vars = {**DEFAULT_VARS}
-    format_vars = {**vars, "env": {**os.environ, **env}}
+    raw_vars: dict = {**sb.get("vars", {})}
+    vars: dict = {**DEFAULT_VARS}
+    format_vars: dict = {**vars, "env": {**os.environ, **env}}
     while True:
         changed: bool = False
         for parsed, raw in ((vars, raw_vars), (env, raw_env)):
@@ -236,8 +238,8 @@ def get_sandbox(sb: dict) -> dict:
             assert False  # circular definition
 
     # Parse mounts & chmod; note sb[mounts|chmod] are tuple[key,v] because of 'items' merge policy:
-    mounts: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("mounts", ()) if v}
-    chmod: dict[str, Any] = {os.path.expanduser(k.format(**format_vars).rstrip("/")): v for k, v in sb.get("chmod", ()) if v}
+    mounts: dict[str, Any] = {expand(k, format_vars).rstrip("/"): v for k, v in sb.get("mounts", ()) if v}
+    chmod: dict[str, Any] = {expand(k, format_vars).rstrip("/"): v for k, v in sb.get("chmod", ()) if v}
 
     return {**sb, "vars": vars, "env": env, "envUnset": env_unset,
             "mounts": mounts, "chmod": chmod}
@@ -291,14 +293,14 @@ def get_bwrap_args(sb: dict) -> list[str]:
         elif opt_name in ("userns", "userns2", "pidns", "syncFd", "blockFd",
                           "userNsBlockFd", "infoFd", "jsonStatusFd"):
             return str(value)
-        return str(value).format(**format_vars)
+        return str(value).format(**format_vars)  # TODO: instead of .format(), invoke our expand()?
 
     def format_datasource_value(value) -> str:  # {fd: number} | {content: string, raw?: boolean, base64?: boolean}
         if (fd := value.get("fd")) is not None:
             return str(fd)
         elif (content := value.get("content")) is not None:
             if not value.get("raw"):
-                content = content.format(**format_vars)
+                content = content.format(**format_vars)  # TODO: instead of .format(), invoke our expand()?
 
             if value.get("base64"):
                 content = base64.b64decode(content)
@@ -314,7 +316,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
             perms = f"0{int(perms, 0):o}"
         return "--perms", str(perms)
 
-    format_vars = {**sb["vars"], "env": {**os.environ, **sb["env"]}}
+    format_vars: dict = {**sb["vars"], "env": {**os.environ, **sb["env"]}}
     args: list[str] = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f)]
     for o in BWRAP_OPTIONS:
         if (v := sb.get(o)) not in (False, None):
@@ -323,7 +325,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
         for v in sb.get(o, ()):
             if v not in (False, None):
                 args += (f"--{bwrap_name(o)}", format_option_value(o, v))
-    args += (arg.format(**format_vars) for arg in sb.get("extraArgs", ()))
+    args += (arg.format(**format_vars) for arg in sb.get("extraArgs", ()))  # TODO: instead of .format(), invoke our expand()?
     for e in sb["envUnset"]:
         args += ("--unsetenv", e)
     for k, v in sb["env"].items():
@@ -334,16 +336,16 @@ def get_bwrap_args(sb: dict) -> list[str]:
         if mount in ("proc", "dev", "tmpfs", "mqueue", "dir"):
             # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
             #       key formatting was already done in the end of get_sandbox()?
-            args += (f"--{mount}", dest_path.format(**format_vars))
+            args += (f"--{mount}", dest_path.format(**format_vars))  # TODO: instead of .format(), invoke our expand()?
         # convenience for when SRC & DEST are the same; note:
         # - it covers also '-try' or '-create' suffixes;
         # - the '-create' suffix is our own convention and will be stripped from final flag;
-        #   it creates the SRC dir if id doesn't exist
-        elif isinstance(mount, str) and re.match(r"(ro-|dev-)?bind(-try|-create)?(:|$)", mount):
+        #   it creates the SRC dir if it doesn't exist
+        elif isinstance(mount, str) and re.match(r"(ro-|dev-)?bind(-try|-create)?(:.|$)", mount):
             src_path = dest_path
             if ":" in mount:
                 mount, src_path = mount.split(":", 1)
-                src_path = os.path.expanduser(src_path.format(**format_vars))
+                src_path = expand(src_path, format_vars)
             if mount.endswith("-create"):
                 mount = mount.removesuffix("-create")
                 os.makedirs(src_path, exist_ok=True)
@@ -358,11 +360,11 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 args += get_perms(dir)
                 args += ("--dir", dest_path)
             elif (symlink := mount.get("symlink")) is not None:  # { symlink: string }
-                args += ("--symlink", symlink.format(**format_vars), dest_path)
+                args += ("--symlink", symlink.format(**format_vars), dest_path)  # TODO: instead of .format(), invoke our expand()?
             elif (bind := mount.get("bind")) is not None:  # { bind: { path: string; ro?: boolean; dev?: boolean; try?: boolean, create?: boolean }}
                 prefix = "dev-" if bind.get("dev") else "ro-" if bind.get("ro") else ""
                 suffix = "-try" if bind.get("try") else ""
-                src_path = os.path.expanduser(bind.get("path", dest_path).format(**format_vars))
+                src_path = expand(bind.get("path", dest_path), format_vars)
                 if bind.get("create") is True:
                     os.makedirs(src_path, exist_ok=True)
                 args += (f"--{prefix}bind{suffix}", src_path, dest_path)
@@ -377,7 +379,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
                          format_datasource_value(data), dest_path)
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
                 for lower in overlay["lower"]:
-                    args += ("--overlay-src", lower.format(**format_vars))
+                    args += ("--overlay-src", lower.format(**format_vars))  # TODO: instead of .format(), invoke our expand()?
                 mode = overlay.get("mode", "rw" if "upper" in overlay and "work" in overlay else "tmp")
                 if mode == "rw":
                     args += ("--overlay", overlay["upper"], overlay["work"], dest_path)  # i.e. --overlay RWSRC WORKDIR DEST
@@ -415,11 +417,11 @@ def get_dbus_proxy_args(dbus: dict, bus_name: str) -> list[str]:
 
 # if required so by the sb's config, start a xdg-dbus-proxy subprocess and
 # return additional bwrap parameters to pass to the main sandbox command
-def setup_dbus_proxy(sb: dict) -> list[str]:
+def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
     if not (dbus := sb.get("dbus")):
         if "dbus" in sb:  # sanity
             raise Exception("empty [dbus] key/block not allowed")
-        return []  # no dbus proxies configured, bail
+        return ()  # no dbus proxies configured, bail
 
     proxy_dir: str = f"{XDG_RUNTIME}/xdg-dbus-proxy/{INSTANCE_ID}"
 
@@ -569,13 +571,15 @@ debug_object("configs", CONFIGS)
 INSTANCE_ID: str = f"{APP_BASE}-{os.getpid()}"
 DEFAULT_VARS: dict[str, str] = {
     "instance_id": INSTANCE_ID,
+    "home": HOME,  # if using prefix home, then prefer using ~
     "xdg_runtime": XDG_RUNTIME,
     "xdg_config": str(XDG_CONFIG),
-    "xdg_data": str(XDG_DATA),
-    "xdg_state": str(XDG_STATE),
-    "xdg_cache": str(XDG_CACHE),
+    "xdg_data": os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"),
+    "xdg_state": os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"),
+    "xdg_cache": os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"),
     "cwd": os.getcwd(),
     "executable": ARGS.executable,  # str | None
+    "exe": EXECUTABLE_NAME,
     "name": f"{APP_BASE}.{EXECUTABLE_NAME}",
 }
 
