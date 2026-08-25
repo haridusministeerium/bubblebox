@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 from collections.abc import Iterable
+from collections import UserDict
 from typing import Any
 import platform
 import pprint
@@ -18,13 +19,28 @@ import sys
 import yaml
 import fcntl
 
+
+# allows for stacking env vars, e.g. multiple profiles having
+# PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars
+class SafeDict(UserDict):
+    # makes sure missing format key does not throw KeyError, but leaves the format unexpanded;
+    # this also means get() should be invoked on instances of this dict only w/ format_map()
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+    def __setitem__(self, key, value):
+        if (isinstance(value, (str, int, float))
+                and value not in (True, False)):  # note we don't store bools either (bool is subclass of int!)
+            super().__setitem__(key, str(value))
+
+
 LOGGER: logging.Logger = logging.getLogger()
 
 HOME: str = os.environ["HOME"]
 XDG_CONFIG: Path = Path(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"))
 XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
 
-SB_CONFIG: Path = XDG_CONFIG / "sandbox"
+SB_CONFIG: Path = XDG_CONFIG / "bubblebox"
 
 SANDBOXES_CACHE: dict[str, dict] = {}
 GLOBAL_SANDBOXES: list[dict] = []
@@ -56,12 +72,13 @@ MERGE_POLICIES: dict[str, set[str]] = {
   # TODO: wouldn't "override" or "overwrite" be a better name than "literal"?
   "literal": BWRAP_FLAGS
         .union(BWRAP_OPTIONS)
-        .union({"disableSandbox", "vars.*", "env.*", "dbus.sloppyNames",
+        .union({"disableSandbox", "dbus.sloppyNames",
                 "dbus.user.sloppyNames", "dbus.system.sloppyNames",
                 "dbus.sandbox.*", "dbus.policies.*", "dbus.user.policies.*",
                 "dbus.system.policies.*"}),
   "list": BWRAP_LIST_OPTIONS
         .union({"extraArgs", "matches"}),
+  "literal-expandable": {"env.*", "vars.*"},
   "dict": {"vars", "env", "dbus", "dbus.sandbox", "dbus.policies",
            "dbus.user.policies", "dbus.system.policies", "dbus.user", "dbus.system",
            "dbus.rules", "dbus.user.rules", "dbus.system.rules"},
@@ -92,8 +109,11 @@ def load_sandboxes_file(path: Path|str, default_name: str|None=None) -> list[dic
 
 
 def try_load_sandbox(name: str) -> dict|None:
-    if name in SANDBOXES_CACHE:
+    if name == "config":  # global config
+        raise Exception(f"profile/config name cannot be [{name}]")
+    elif name in SANDBOXES_CACHE:
         return SANDBOXES_CACHE[name]
+
     candidate_paths: tuple[Path, ...] = (
         Path(name),
         Path(f"{name}.yml"),
@@ -102,7 +122,7 @@ def try_load_sandbox(name: str) -> dict|None:
         SB_CONFIG / f"{name}.yaml",
     )
     for p in candidate_paths:
-        if p.exists():
+        if p.is_file():
             return load_sandboxes_file(p, name)[0]
 
 
@@ -123,22 +143,38 @@ def get_merge_policy(path: list[str], k: str) -> tuple[str, list[str]]:
     raise Exception(f"Unknown key while merging: {".".join(path + [k])}")
 
 
-def merge(a: dict[str, Any], b: dict[str, Any], path: list[str]=[]) -> dict[str, Any]:
+def merge(a: dict[str, Any], b: dict[str, Any], format_env: SafeDict, path: list[str]=[]) -> dict[str, Any]:
     res = {}
-    for k in set(a.keys()).union(b.keys()):
+    # note we sort so we get e.g. 'vars' before 'env'; otherwise result is not deterministic
+    # as our envs & vars are stackable/extendable from sb-to-sb:
+    for k in sorted(set(a.keys()).union(b.keys()), reverse=True):
         policy, key_path = get_merge_policy(path, k)
         match policy:
             case "list":
                 res[k] = a.get(k, []) + b.get(k, [])
             case "items":
-                left = a.get(k, {})
-                right = b.get(k, {})
+                left = a.get(k, [])
+                right = b.get(k, [])
                 res[k] = (list(left.items()) if isinstance(left, dict) else left) + \
                          (list(right.items()) if isinstance(right, dict) else right)
             case "dict":
-                res[k] = merge(a.get(k, {}), b.get(k, {}), key_path)
+                res[k] = merge(a.get(k, {}), b.get(k, {}), format_env, key_path)
             case "literal":
                 res[k] = b.get(k, a.get(k))
+            case "literal-expandable":
+                # print(f"env key: [{k}]; a={a.get(k)}; b={b.get(k)}")
+                if k in a:
+                    # if isinstance(a[k], str):
+                        # res[k] = format_env[k] = a[k].format_map(format_env)
+                    # else:
+                        # res[k] = format_env[k] = a[k]
+                    res[k] = format_env[k] = a[k]
+                if k in b:
+                    if isinstance(b[k], str):
+                        res[k] = format_env[k] = b[k].format_map(format_env)
+                    else:
+                        res[k] = format_env[k] = b[k]
+
             case "discard":
                 pass
             case _:
@@ -146,7 +182,7 @@ def merge(a: dict[str, Any], b: dict[str, Any], path: list[str]=[]) -> dict[str,
     return res
 
 
-def merge_sandboxes(sandboxes: Iterable[dict]) -> dict:
+def merge_sandboxes(sandboxes: Iterable[dict], format_env: SafeDict) -> dict:
     def load_include(inc_in: str|dict) -> dict:
         inc: dict = {"name": inc_in} if isinstance(inc_in, str) else inc_in
         if name := inc.get("name"):
@@ -156,7 +192,7 @@ def merge_sandboxes(sandboxes: Iterable[dict]) -> dict:
                 return {}
             return load_sandbox(name)
         elif path := inc.get("path"):
-            if inc.get("try") and not os.path.exists(path):
+            if inc.get("try") and not os.path.isfile(path):
                 return {}
             return load_sandboxes_file(path)[0]
 
@@ -165,8 +201,8 @@ def merge_sandboxes(sandboxes: Iterable[dict]) -> dict:
 
     res = {}
     for sb in sandboxes:
-        inc = merge_sandboxes(load_include(child_sb) for child_sb in sb.get("include", ()))
-        res = merge(res, merge(inc, sb))
+        inc = merge_sandboxes((load_include(child_sb) for child_sb in sb.get("include", ())), format_env)
+        res = merge(res, merge(inc, sb, format_env), format_env)
     return res
 
 
@@ -209,6 +245,9 @@ def get_sandbox(sb: dict) -> dict:
                     raw_env[k] = v["value"]
             else:
                 raise Exception(f"Invalid value for environment variable {k}: {repr(v)}")
+        # TODO: int,float shouldn't occur anymore due to SafeDict, right?:
+        elif isinstance(v, (int, float)):
+            raw_env[k] = str(v)
         else:
             raise Exception(f"Invalid value for environment variable {k}: {repr(v)}")
 
@@ -233,6 +272,7 @@ def get_sandbox(sb: dict) -> dict:
         if not (raw_env or raw_vars):
             break  # all raw values were processed/expanded
         elif not changed:
+            print(f"cirular!! env: {raw_env.keys()}  var: {raw_vars.keys()}")
             # TODO: should we not raise a proper error here?
             assert False  # circular definition
 
@@ -264,7 +304,7 @@ def pipefd_args(args: list[str]) -> str:
 def get_bwrap_args(sb: dict) -> list[str]:
     # convert the camel-cased options to kebab-case used by bwrap
     def bwrap_name(name: str) -> str:
-        # special case, we don't want to get 'argv-0', 'userns-2':
+        # special cases; we don't want to get 'argv-0', 'userns-2':
         if name in ("argv0", "userns2"):
             return name
         return re.sub(r"(?<=[a-z])([A-Z0-9+])", lambda m: "-" + m.group(1).lower(), name)
@@ -316,7 +356,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
         return "--perms", str(perms)
 
     format_vars: dict = {**sb["vars"], "env": {**os.environ, **sb["env"]}}
-    args: list[str] = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f)]
+    args: list[str] = [f"--{bwrap_name(f)}" for f in BWRAP_FLAGS if sb.get(f) is True]
     for o in BWRAP_OPTIONS:
         if (v := sb.get(o)) not in (False, None):
             args += (f"--{bwrap_name(o)}", format_option_value(o, v))
@@ -330,7 +370,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
     for k, v in sb["env"].items():
         args += ("--setenv", k, v)
 
-    # note dest_path is on the sandbox side
+    # note dest_path is on the sandbox side; note it's sorting lexicographically by the first element's (ie. key); not length
     for dest_path, mount in sorted(sb["mounts"].items()):
         if mount in ("proc", "dev", "tmpfs", "mqueue", "dir"):
             # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
@@ -340,7 +380,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
         # - it covers also '-try' or '-create' suffixes;
         # - the '-create' suffix is our own convention and will be stripped from final flag;
         #   it creates the SRC dir if it doesn't exist
-        elif isinstance(mount, str) and re.match(r"(ro-|dev-)?bind(-try|-create)?(:.|$)", mount):
+        elif isinstance(mount, str) and re.match(r"(ro-|dev-)?bind(-try|-create)?(:\S|$)", mount):
             src_path = dest_path
             if ":" in mount:
                 mount, src_path = mount.split(":", 1)
@@ -349,6 +389,8 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 mount = mount.removesuffix("-create")
                 os.makedirs(src_path, exist_ok=True)
             args += (f"--{mount}", src_path, dest_path)
+        elif isinstance(mount, str) and mount.startswith("symlink:"):
+            args += ("--symlink", expand(mount.removeprefix("symlink:"), format_vars), dest_path)
         elif isinstance(mount, dict):
             if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
                 args += get_perms(tmpfs)
@@ -390,7 +432,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
             raise Exception(f"invalid mount (of type {type(mount)}) value: {repr(mount)}")
     # TODO: is there need to do path.format(**format_vars) anymore, given
     #       key formatting was already done in the end of get_sandbox()?
-    # TODO: is sorting for chmod needed?
+    # TODO: is sorting for chmod needed? note it's sorting lexicographically by the first element's (ie. key); not length
     for path, mode in sorted(sb["chmod"].items()):
         args += ("--chmod", str(mode), path.format(**format_vars))
     return args
@@ -463,7 +505,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
     # if 'dbus.sandbox' defined, then it means xdg-dbus-proxy itself is to be ran in bwrap as well:
     # TODO: as of May '26, portals do not work if x-d-p runs unsandboxed:
     if proxy_sb := dbus.get("sandbox"):
-        proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
+        proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,), SafeDict(**os.environ, **DEFAULT_VARS)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
         debug_object("dbus proxy sandbox", proxy_sb)
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
         dbus_proxy_args = ["bwrap", "--args", pipefd_args(proxy_bwrap_args), "--"] + dbus_proxy_args
@@ -515,8 +557,8 @@ ARGS: argparse.Namespace = parser.parse_args()
 if ARGS.log_level:
     logging.basicConfig(stream=sys.stdout, level=getattr(logging, ARGS.log_level.upper()), force=True)
 
-for global_path in (XDG_CONFIG / "sandbox.yaml", XDG_CONFIG / "sandbox.yml"):
-    if global_path.exists():
+for global_path in (SB_CONFIG / "config.yaml", SB_CONFIG / "config.yml"):
+    if global_path.is_file():
         GLOBAL_SANDBOXES += load_sandboxes_file(global_path)
 
 CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a single sandbox config
@@ -579,22 +621,23 @@ DEFAULT_VARS: dict[str, str] = {
     "xdg_cache": os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"),
     "cwd": os.getcwd(),
     "exe_arg": ARGS.executable,  # str | None
-    "exe_name": EXECUTABLE_NAME,  # used to be the old name/fqname value prior to adding mandatory dot for portal
+    "exe_name": EXECUTABLE_NAME,  # used to be the old name/fqname value prior to adding mandatory dot for portal (but we don't want fqname e.g. in our private-home dirname)
     "name": EXECUTABLE_NAME,  # alias for "exe_name"
     "fqname": f"{APP_BASE}.{EXECUTABLE_NAME}",  # fully qualified
 }
 
-SB: dict = get_sandbox(merge_sandboxes(CONFIGS))
+SB: dict = get_sandbox(merge_sandboxes(CONFIGS, SafeDict(**os.environ, **DEFAULT_VARS)))
 debug_object("sandbox", SB)
 
 # TODO: consider removing this option; although this allows us to use matches: key
 #       in config to selectively disable sandboxing for select commands...
-if SB.get("disableSandbox"):
+if SB.get("disableSandbox") is True:
     os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
 
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS += setup_dbus_proxy(SB)
-BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, meaning we dont want any previous fork()s after this, as open files & other resources would get duplicated
+BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, thus we dont want any previous
+                                    # fork()s after this, as open files & other resources would get duplicated
 
 EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
