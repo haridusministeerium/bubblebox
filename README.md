@@ -39,6 +39,7 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 - [syd](https://gitlab.exherbo.org/sydbox/sydbox)
   - another alternative to bwrap/firejail et al;
     > intends to provide a simple interface over various intricate Linux sandboxing mechanisms such as LandLock, Namespaces, Ptrace, and Seccomp-{BPF,Notify}
+  - really comprehensive & promising!
 - [crablock](https://codeberg.org/crabjail/crablock/)
   - more related projects in [crabjail's readme](https://codeberg.org/crabjail/crabjail#related-projects)
 - [simple-appimage-sandbox](https://github.com/Samueru-sama/simple-appimage-sandbox/)
@@ -105,6 +106,10 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
   - odd one, think it's more for providing interface for clients/your grandma
 - [smolvm](https://github.com/smol-machines/smolvm)
   - portable, lightweight, self-contained virtual machine.
+- [rampart](https://github.com/peg/rampart)
+  - llm gateway/filter -- deny/allow/ask policy rules for llm actions
+  - similar to https://github.com/grith-ai/grith I think?
+  - similar to https://github.com/FailproofAI/failproofai
 
 # other resources
 

@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from collections.abc import Iterable
 from collections import UserDict
-from typing import Any
+from typing import Any, NoReturn
 import platform
 import pprint
 import re
@@ -18,10 +18,12 @@ import shlex
 import sys
 import yaml
 import fcntl
+import psutil
 
 
 # allows for stacking env vars, e.g. multiple profiles having
-# PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars
+# PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars; i.e.
+# can extend as opposed to overwriting previous values
 class SafeDict(UserDict):
     # makes sure missing format key does not throw KeyError, but leaves the format unexpanded;
     # this also means get() should be invoked on instances of this dict only w/ format_map()
@@ -30,7 +32,7 @@ class SafeDict(UserDict):
 
     def __setitem__(self, key, value):
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):  # note we don't store bools either (bool is subclass of int!)
-            super().__setitem__(key, str(value))
+            super().__setitem__(key, os.path.expanduser(str(value)))
 
 
 LOGGER: logging.Logger = logging.getLogger()
@@ -71,7 +73,7 @@ MERGE_POLICIES: dict[str, set[str]] = {
   # TODO: wouldn't "override" or "overwrite" be a better name than "literal"?
   "literal": BWRAP_FLAGS
         .union(BWRAP_OPTIONS)
-        .union({"disableSandbox", "dbus.sloppyNames",
+        .union({"disableSandbox", "singleton", "dbus.sloppyNames",
                 "dbus.user.sloppyNames", "dbus.system.sloppyNames",
                 "dbus.sandbox.*", "dbus.policies.*", "dbus.user.policies.*",
                 "dbus.system.policies.*"}),
@@ -108,7 +110,7 @@ def load_sandboxes_file(path: Path|str, default_name: str|None=None) -> list[dic
 
 
 def try_load_sandbox(name: str) -> dict|None:
-    if name == "config":  # global config
+    if name == "config":  # global app config
         raise Exception(f"profile/config name cannot be [{name}]")
     elif name in SANDBOXES_CACHE:
         return SANDBOXES_CACHE[name]
@@ -280,7 +282,8 @@ def get_sandbox(sb: dict) -> dict:
     chmod: dict[str, Any] = {expand(k, format_vars).rstrip("/"): v for k, v in sb.get("chmod", ()) if v}
 
     return {**sb, "vars": vars, "env": env, "envUnset": env_unset,
-            "mounts": mounts, "chmod": chmod}
+            "mounts": mounts, "chmod": chmod, "format_vars": format_vars}  # note we store the resulting format_vars
+                                                                           # just-in-case for potential later use
 
 
 # returns string representation of read end of the pipe FD
@@ -449,8 +452,8 @@ def get_dbus_proxy_args(dbus: dict, bus_name: str) -> list[str]:
     args += (f"--{policy}={name}" for name, policy in policies.items())
 
     for rule_type in ("broadcast", "call"):
-        ruleset: list[tuple[str, str]] = dbus.get("rules", {}).get(rule_type, []) + \
-                                         b.get("rules", {}).get(rule_type, [])
+        ruleset: list[tuple[str, str]] = (dbus.get("rules", {}).get(rule_type, []) +
+                                          b.get("rules", {}).get(rule_type, []))
         args += (f"--{rule_type}={name}={rule}" for name, rule in ruleset)
     return args
 
@@ -494,7 +497,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 
     if not dbus_proxy_args:  # sanity
         prefix = f"[{sb['name']}] " if "name" in sb else ""
-        raise Exception(f"{prefix}sandbox has [dbus] block configured, but none of {[b[0] for b in buses]} buses under it")
+        raise Exception(f"{prefix}sandbox has [dbus] block configured, but none of {[b[0] for b in buses]} bus(es) under it")
 
     os.makedirs(proxy_dir, exist_ok=True)
     pr, pw = os.pipe2(0)
@@ -524,9 +527,8 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 # - https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d#gistcomment-5515250
 def get_bwrapinfo_args() -> tuple[str, str]:
     global INFO_FD  # so it's not gc-d prematurely
-    info_path = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
-    os.makedirs(os.path.dirname(info_path), exist_ok=True)
-    INFO_FD = open(info_path, "w")
+    os.makedirs(os.path.dirname(BWRAP_INFOF), exist_ok=True)
+    INFO_FD = open(BWRAP_INFOF, "w")
     fcntl.fcntl(INFO_FD, fcntl.F_SETFD, 0)
     return "--info-fd", str(INFO_FD.fileno())
 
@@ -534,6 +536,73 @@ def get_bwrapinfo_args() -> tuple[str, str]:
 def debug_object(label: str, obj: object) -> None:
     if LOGGER.isEnabledFor(logging.DEBUG):
         LOGGER.debug(f"{label}:\n{pprint.pformat(obj)}")
+
+
+# def process_active(pid: int) -> psutil.Process|None:
+    # try:
+        # return (psutil.pid_exists(pid) and psutil.Process(pid).status()
+                # not in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE))
+    # except psutil.Error:  # includes NoSuchProcess error
+        # return None
+
+# from https://stackoverflow.com/a/74720401/1803648
+def process_active(pid: int) -> psutil.Process|None:
+    try:
+        process = psutil.Process(pid)
+    except psutil.Error:  # includes NoSuchProcess error
+        return None
+    if psutil.pid_exists(pid) and process.status() not in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE):
+        return process
+
+
+def get_running_instance_bwrapinfo() -> dict|None:
+    try:
+        with open(SINGLETON_LOCATION, "r") as f:
+            bwrap_infof = f.read()
+        with open(bwrap_infof, "r") as f:
+            info: dict = json.loads(f.read())
+            # sanity checks:
+            # expected_bwrap_keys: set[str] = {"child-pid", "mnt-namespace", "pid-namespace", "net-namespace",
+                                             # "ipc-namespace", "uts-namespace", "cgroup-namespace"}
+            expected_bwrap_keys: set[str] = {i + "-namespace" for i in ("mnt", "pid", "net", "ipc", "uts", "cgroup")} | {"child-pid"}
+            bwrap_info_keys: set[str] = set(info.keys())
+            if not bwrap_info_keys.issubset(expected_bwrap_keys):
+                raise Exception(f"bwrap_info contains unexpected keys: {bwrap_info_keys-expected_bwrap_keys}")
+            elif len(bwrap_info_keys) < 2:  # at least child-pid and one namespace
+                raise Exception(f"bwrap_info contains only {len(bwrap_info_keys)} key(s), expected at least 2")
+        if bwrap_proc := process_active(info["child-pid"]):
+            info["bwrap_proc"] = bwrap_proc
+            return info
+    except IOError:
+        pass
+
+
+# TODO: lacking seccomp filters; consider re-adding, or migrating to gvisor?
+#       alternatively consider https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5926910#file-sandbox-py-L135-L142
+def enter_existing_ns(bwrap_info: dict) -> NoReturn:
+    child: psutil.Process = next(c for c in bwrap_info["bwrap_proc"].children())  # first child running _in_ the sandbox namespace
+    nsent_args: list[str] = ["nsenter", "--preserve-credentials", "--user",
+                             "--keep-caps", "--env", "--target", str(child.pid)]
+
+    if "mnt-namespace" in bwrap_info:
+        nsent_args.append("--mount")
+    if "pid-namespace" in bwrap_info:
+        nsent_args.append("--pid")
+    if "net-namespace" in bwrap_info:
+        nsent_args.append("--net")
+    if "ipc-namespace" in bwrap_info:
+        nsent_args.append("--ipc")
+    if "uts-namespace" in bwrap_info:
+        nsent_args.append("--uts")
+    if "cgroup-namespace" in bwrap_info:
+        nsent_args.append("--cgroup")
+
+    if wd := SB.get("chdir"):
+        nsent_args.append("--wdns=" + expand(wd, SB["format_vars"]))
+
+    nsent_args += ("--", EFFECTIVE_EXEC, *ARGS.args)
+    LOGGER.debug("nsenter command: %s\n", shlex.join(nsent_args))
+    os.execlp(nsent_args[0], *nsent_args)
 
 
 # ENTRY
@@ -591,6 +660,7 @@ for source_type, source_data in CONFIGS_SOURCES:
             raise NotImplementedError
 
 EXECUTABLE_NAME: str = os.path.basename(ARGS.executable or os.environ.get("SHELL", "sh"))
+EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
 
 if ARGS.autoload:
     if (sb := try_load_sandbox(EXECUTABLE_NAME)) and sb not in CONFIGS:
@@ -621,7 +691,7 @@ DEFAULT_VARS: dict[str, str] = {
     "cwd": os.getcwd(),
     "exe_arg": ARGS.executable,  # str | None
     "exe_name": EXECUTABLE_NAME,  # used to be the old name/fqname value prior to adding mandatory dot for portal (but we don't want fqname e.g. in our private-home dirname)
-    "name": EXECUTABLE_NAME,  # alias for "exe_name"
+    #"name": EXECUTABLE_NAME,  # note we don't want to deine default for 'name', as then we can't override it w/ custom value for e.g. private-home profile
     "fqname": f"{APP_BASE}.{EXECUTABLE_NAME}",  # fully qualified
 }
 
@@ -633,12 +703,22 @@ debug_object("sandbox", SB)
 if SB.get("disableSandbox") is True:
     os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
 
+BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
+SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("name")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance
+if SB.get("singleton") is True and (bwrap_info := get_running_instance_bwrapinfo()):
+    enter_existing_ns(bwrap_info)
+
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS += setup_dbus_proxy(SB)
 BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, thus we dont want any previous
                                     # fork()s after this, as open files & other resources would get duplicated
+if SB.get("singleton") is True:
+    if not SB.get("name"):
+        raise Exception("singleton=True set, but no [name] attr configured")
+    os.makedirs(os.path.dirname(SINGLETON_LOCATION), exist_ok=True)
+    with open(SINGLETON_LOCATION, "w") as f:
+        f.write(BWRAP_INFOF)
 
-EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
                                                ["--", EFFECTIVE_EXEC] + ARGS.args))
 os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS), "--", EFFECTIVE_EXEC, *ARGS.args)
