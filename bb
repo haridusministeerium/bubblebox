@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from collections.abc import Iterable
 from collections import UserDict
-from typing import Any
+from typing import Any, NoReturn
 import platform
 import pprint
 import re
@@ -18,10 +18,12 @@ import shlex
 import sys
 import yaml
 import fcntl
+import psutil
 
 
 # allows for stacking env vars, e.g. multiple profiles having
-# PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars
+# PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars; i.e.
+# can extend as opposed to overwriting previous values
 class SafeDict(UserDict):
     # makes sure missing format key does not throw KeyError, but leaves the format unexpanded;
     # this also means get() should be invoked on instances of this dict only w/ format_map()
@@ -31,7 +33,7 @@ class SafeDict(UserDict):
     def __setitem__(self, key, value):
         if (isinstance(value, (str, int, float))
                 and value not in (True, False)):  # note we don't store bools either (bool is subclass of int!)
-            super().__setitem__(key, str(value))
+            super().__setitem__(key, os.path.expanduser(str(value)))
 
 
 LOGGER: logging.Logger = logging.getLogger()
@@ -109,7 +111,7 @@ def load_sandboxes_file(path: Path|str, default_name: str|None=None) -> list[dic
 
 
 def try_load_sandbox(name: str) -> dict|None:
-    if name == "config":  # global config
+    if name == "config":  # global app config
         raise Exception(f"profile/config name cannot be [{name}]")
     elif name in SANDBOXES_CACHE:
         return SANDBOXES_CACHE[name]
@@ -525,9 +527,8 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 # - https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d#gistcomment-5515250
 def get_bwrapinfo_args() -> tuple[str, str]:
     global INFO_FD  # so it's not gc-d prematurely
-    info_path = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
-    os.makedirs(os.path.dirname(info_path), exist_ok=True)
-    INFO_FD = open(info_path, "w")
+    os.makedirs(os.path.dirname(BWRAP_INFOF), exist_ok=True)
+    INFO_FD = open(BWRAP_INFOF, "w")
     fcntl.fcntl(INFO_FD, fcntl.F_SETFD, 0)
     return "--info-fd", str(INFO_FD.fileno())
 
@@ -535,6 +536,54 @@ def get_bwrapinfo_args() -> tuple[str, str]:
 def debug_object(label: str, obj: object) -> None:
     if LOGGER.isEnabledFor(logging.DEBUG):
         LOGGER.debug(f"{label}:\n{pprint.pformat(obj)}")
+
+
+def process_active(pid: int) -> bool:
+    try:
+        return (psutil.pid_exists(pid) and psutil.Process(pid).status()
+                not in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE))
+    except psutil.Error:  # includes NoSuchProcess error
+        return False
+
+
+def get_running_instance_bwrapinfo() -> dict|None:
+    try:
+        with open(SINGLETON_LOCATION, "r") as f:
+            bwrap_infof = f.read()
+        with open(bwrap_infof, "r") as f:
+            info = json.loads(f.read())
+        if process_active(info["child-pid"]):
+            return info
+    except IOError:
+        pass
+
+
+# TODO: lacking seccomp filters; consider re-adding, or migrating to gvisor?
+#       alternatively consider https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5926910#file-sandbox-py-L135-L142
+def enter_existing_ns(bwrap_info: dict) -> NoReturn:
+    pid: int = bwrap_info["child-pid"]  # this is the PID of bwrap process
+    child: psutil.Process = next(x for x in psutil.Process(pid).children())  # first child running _in_ the namespace
+    nsent_args: list[str] = ["nsenter", "--preserve-credentials", "--user",
+                             "--keep-caps", "--env", "--target", str(child.pid)]
+    if "mnt-namespace" in bwrap_info:
+        nsent_args += "--mount"
+    if "pid-namespace" in bwrap_info:
+        nsent_args += "--pid"
+    if "net-namespace" in bwrap_info:
+        nsent_args += "--net"
+    if "ipc-namespace" in bwrap_info:
+        nsent_args += "--ipc"
+    if "uts-namespace" in bwrap_info:
+        nsent_args += "--uts"
+    if "cgroup-namespace" in bwrap_info:
+        nsent_args += "--cgroup"
+
+    if wd := SB.get("chdir"):
+        nsent_args += f"--wdns={wd}"
+
+    nsent_args += ("--", EFFECTIVE_EXEC, *ARGS.args)
+    LOGGER.debug("nsenter command: %s\n", shlex.join(nsent_args))
+    os.execlp(nsent_args[0], *nsent_args)
 
 
 # ENTRY
@@ -592,6 +641,7 @@ for source_type, source_data in CONFIGS_SOURCES:
             raise NotImplementedError
 
 EXECUTABLE_NAME: str = os.path.basename(ARGS.executable or os.environ.get("SHELL", "sh"))
+EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
 
 if ARGS.autoload:
     if (sb := try_load_sandbox(EXECUTABLE_NAME)) and sb not in CONFIGS:
@@ -634,12 +684,20 @@ debug_object("sandbox", SB)
 if SB.get("disableSandbox") is True:
     os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
 
+BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
+SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("name")}.instance.info"
+if SB.get("singleton") is True and (bwrap_info := get_running_instance_bwrapinfo()):
+    enter_existing_ns(bwrap_info)
+
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
 BWRAP_ARGS += setup_dbus_proxy(SB)
 BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, thus we dont want any previous
                                     # fork()s after this, as open files & other resources would get duplicated
+if SB.get("singleton") is True:
+    os.makedirs(os.path.dirname(SINGLETON_LOCATION), exist_ok=True)
+    with open(SINGLETON_LOCATION, "w") as f:
+        f.write(BWRAP_INFOF)
 
-EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
                                                ["--", EFFECTIVE_EXEC] + ARGS.args))
 os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS), "--", EFFECTIVE_EXEC, *ARGS.args)
