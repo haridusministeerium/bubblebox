@@ -73,7 +73,7 @@ MERGE_POLICIES: dict[str, set[str]] = {
   # TODO: wouldn't "override" or "overwrite" be a better name than "literal"?
   "literal": BWRAP_FLAGS
         .union(BWRAP_OPTIONS)
-        .union({"disableSandbox", "singleton", "dbus.sloppyNames",
+        .union({"name", "disableSandbox", "singleton", "dbus.sloppyNames",
                 "dbus.user.sloppyNames", "dbus.system.sloppyNames",
                 "dbus.sandbox.*", "dbus.policies.*", "dbus.user.policies.*",
                 "dbus.system.policies.*"}),
@@ -83,7 +83,7 @@ MERGE_POLICIES: dict[str, set[str]] = {
   "dict": {"vars", "env", "dbus", "dbus.sandbox", "dbus.policies",
            "dbus.user.policies", "dbus.system.policies", "dbus.user", "dbus.system",
            "dbus.rules", "dbus.user.rules", "dbus.system.rules"},
-  "discard": {"name", "include"},
+  "discard": {"include"},
 }
 
 
@@ -691,7 +691,11 @@ DEFAULT_VARS: dict[str, str] = {
     "cwd": os.getcwd(),
     "exe_arg": ARGS.executable,  # str | None
     "exe_name": EXECUTABLE_NAME,  # used to be the old name/fqname value prior to adding mandatory dot for portal (but we don't want fqname e.g. in our private-home dirname)
-    #"name": EXECUTABLE_NAME,  # note we don't want to deine default for 'name', as then we can't override it w/ custom value for e.g. private-home profile
+    # NOTE: either allow defining default 'name' var here and make sure to use it directly in private-home profile's [mount], OR
+    #       remove default 'name' here, which would allow you to reference it in private-home's [private-home' var, e.g. [private-home: "{xdg_data}/bubblebox/homes/{name}"]
+    #       if you keep the default and reference it in another var, then you won't be able to overwrite the name, and private home dir will
+    #       always be named this default
+    "name": EXECUTABLE_NAME,
     "fqname": f"{APP_BASE}.{EXECUTABLE_NAME}",  # fully qualified
 }
 
@@ -706,6 +710,7 @@ if SB.get("disableSandbox") is True:
 BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
 SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("name")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance
 if SB.get("singleton") is True and (bwrap_info := get_running_instance_bwrapinfo()):
+    LOGGER.debug(f"existing bwrap instance (from {SINGLETON_LOCATION}): {bwrap_info}")
     enter_existing_ns(bwrap_info)
 
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
