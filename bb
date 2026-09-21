@@ -23,7 +23,7 @@ import psutil
 
 # allows for stacking env vars, e.g. multiple profiles having
 # PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars; i.e.
-# can extend as opposed to overwriting previous values
+# can extend/stack as opposed to overwriting previous values
 class SafeDict(UserDict):
     # makes sure missing format key does not throw KeyError, but leaves the format unexpanded;
     # this also means get() should be invoked on instances of this dict only w/ format_map()
@@ -45,6 +45,14 @@ SB_CONFIG: Path = XDG_CONFIG / "bubblebox"
 
 SANDBOXES_CACHE: dict[str, dict] = {}
 GLOBAL_SANDBOXES: list[dict] = []
+
+MNT_NS: str = "mnt-namespace"
+PID_NS: str = "pid-namespace"
+NET_NS: str = "net-namespace"
+IPC_NS: str = "ipc-namespace"
+UTS_NS: str = "uts-namespace"
+CGROUP_NS: str = "cgroup-namespace"
+
 
 BWRAP_FLAGS: set[str] = {"levelPrefix", "unshareAll", "shareNet", "unshareUser",
                          "unshareUserTry", "unshareIpc", "unsharePid", "unshareNet",
@@ -73,7 +81,7 @@ MERGE_POLICIES: dict[str, set[str]] = {
   # TODO: wouldn't "override" or "overwrite" be a better name than "literal"?
   "literal": BWRAP_FLAGS
         .union(BWRAP_OPTIONS)
-        .union({"name", "disableSandbox", "singleton", "dbus.sloppyNames",
+        .union({"id", "disableSandbox", "singleton", "dbus.sloppyNames",
                 "dbus.user.sloppyNames", "dbus.system.sloppyNames",
                 "dbus.sandbox.*", "dbus.policies.*", "dbus.user.policies.*",
                 "dbus.system.policies.*"}),
@@ -99,38 +107,38 @@ def tagged_append(tag: str, dest: list[tuple[str,str]]):
     return TaggedAppend
 
 
-def load_sandboxes_file(path: Path|str, default_name: str|None=None) -> list[dict]:
+def load_sandboxes_file(path: Path|str, default_id: str|None=None) -> list[dict]:
     LOGGER.debug("loading %s", path)
     with open(path) as fd:
         sandboxes: list[dict] = list(yaml.safe_load_all(fd))
         for i, sb in enumerate(sandboxes):
-            if name := sb.get("name", default_name if i == 0 else None):
-                SANDBOXES_CACHE[name] = sb
+            if id := sb.get("id", default_id if i == 0 else None):
+                SANDBOXES_CACHE[id] = sb
         return sandboxes
 
 
-def try_load_sandbox(name: str) -> dict|None:
-    if name == "config":  # global app config
-        raise Exception(f"profile/config name cannot be [{name}]")
-    elif name in SANDBOXES_CACHE:
-        return SANDBOXES_CACHE[name]
+def try_load_sandbox(id: str) -> dict|None:
+    if id == "config":  # global app config
+        raise Exception(f"profile/config id cannot be [{id}]")
+    elif id in SANDBOXES_CACHE:
+        return SANDBOXES_CACHE[id]
 
     candidate_paths: tuple[Path, ...] = (
-        Path(name),
-        Path(f"{name}.yml"),
-        Path(f"{name}.yaml"),
-        SB_CONFIG / f"{name}.yml",
-        SB_CONFIG / f"{name}.yaml",
+        Path(id),
+        Path(f"{id}.yml"),
+        Path(f"{id}.yaml"),
+        SB_CONFIG / f"{id}.yml",
+        SB_CONFIG / f"{id}.yaml",
     )
     for p in candidate_paths:
         if p.is_file():
-            return load_sandboxes_file(p, name)[0]
+            return load_sandboxes_file(p, id)[0]
 
 
-def load_sandbox(name: str) -> dict:
-    if (sb := try_load_sandbox(name)) is not None:
+def load_sandbox(id: str) -> dict:
+    if (sb := try_load_sandbox(id)) is not None:
         return sb
-    raise Exception(f"[{name}] sandbox not found")
+    raise Exception(f"[{id}] sandbox not found")
 
 
 def get_merge_policy(path: list[str], k: str) -> tuple[str, list[str]]:
@@ -185,13 +193,13 @@ def merge(a: dict[str, Any], b: dict[str, Any], format_env: SafeDict, path: list
 
 def merge_sandboxes(sandboxes: Iterable[dict], format_env: SafeDict) -> dict:
     def load_include(inc_in: str|dict) -> dict:
-        inc: dict = {"name": inc_in} if isinstance(inc_in, str) else inc_in
-        if name := inc.get("name"):
+        inc: dict = {"id": inc_in} if isinstance(inc_in, str) else inc_in
+        if id := inc.get("id"):
             if inc.get("try"):
-                if sb := try_load_sandbox(name):
+                if sb := try_load_sandbox(id):
                     return sb
                 return {}
-            return load_sandbox(name)
+            return load_sandbox(id)
         elif path := inc.get("path"):
             if inc.get("try") and not os.path.isfile(path):
                 return {}
@@ -273,9 +281,7 @@ def get_sandbox(sb: dict) -> dict:
         if not (raw_env or raw_vars):
             break  # all raw values were processed/expanded
         elif not changed:
-            print(f"cirular!! env: {raw_env.keys()}  var: {raw_vars.keys()}")
-            # TODO: should we not raise a proper error here?
-            assert False  # circular definition
+            raise Exception(f"circular def!! env: {raw_env.keys()}  var: {raw_vars.keys()}")
 
     # Parse mounts & chmod; note sb[mounts|chmod] are tuple[key,v] because of 'items' merge policy:
     mounts: dict[str, Any] = {expand(k, format_vars).rstrip("/"): v for k, v in sb.get("mounts", ()) if v}
@@ -470,7 +476,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 
     unix_path_prefix: str = "unix:path="
     dbus_sess_bus_env_var: str = "DBUS_SESSION_BUS_ADDRESS"
-    dbus_session_address: str = os.environ.get(dbus_sess_bus_env_var, f"{unix_path_prefix}/run/user/{os.getuid()}/bus")
+    dbus_session_address: str = os.environ.get(dbus_sess_bus_env_var, f"{unix_path_prefix}{XDG_RUNTIME}/bus")
     buses: tuple[tuple[str,str,str|None], ...] = (
         ("system", f"{unix_path_prefix}/run/dbus/system_bus_socket", None),
         ("user", dbus_session_address, dbus_sess_bus_env_var),
@@ -496,7 +502,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
             cmd_bwrap_args += ("--setenv", addr_env, address)
 
     if not dbus_proxy_args:  # sanity
-        prefix = f"[{sb['name']}] " if "name" in sb else ""
+        prefix = f"[{sb["id"]}] " if "id" in sb else ""
         raise Exception(f"{prefix}sandbox has [dbus] block configured, but none of {[b[0] for b in buses]} bus(es) under it")
 
     os.makedirs(proxy_dir, exist_ok=True)
@@ -562,9 +568,8 @@ def get_running_instance_bwrapinfo() -> dict|None:
         with open(bwrap_infof, "r") as f:
             info: dict = json.loads(f.read())
             # sanity checks:
-            # expected_bwrap_keys: set[str] = {"child-pid", "mnt-namespace", "pid-namespace", "net-namespace",
-                                             # "ipc-namespace", "uts-namespace", "cgroup-namespace"}
-            expected_bwrap_keys: set[str] = {i + "-namespace" for i in ("mnt", "pid", "net", "ipc", "uts", "cgroup")} | {"child-pid"}
+            expected_bwrap_keys: set[str] = {MNT_NS, PID_NS, NET_NS, IPC_NS,
+                                             UTS_NS, CGROUP_NS, "child-pid"}
             bwrap_info_keys: set[str] = set(info.keys())
             if not bwrap_info_keys.issubset(expected_bwrap_keys):
                 raise Exception(f"bwrap_info contains unexpected keys: {bwrap_info_keys-expected_bwrap_keys}")
@@ -584,17 +589,17 @@ def enter_existing_ns(bwrap_info: dict) -> NoReturn:
     nsent_args: list[str] = ["nsenter", "--preserve-credentials", "--user",
                              "--keep-caps", "--env", "--target", str(child.pid)]
 
-    if "mnt-namespace" in bwrap_info:
+    if MNT_NS in bwrap_info:
         nsent_args.append("--mount")
-    if "pid-namespace" in bwrap_info:
+    if PID_NS in bwrap_info:
         nsent_args.append("--pid")
-    if "net-namespace" in bwrap_info:
+    if NET_NS in bwrap_info:
         nsent_args.append("--net")
-    if "ipc-namespace" in bwrap_info:
+    if IPC_NS in bwrap_info:
         nsent_args.append("--ipc")
-    if "uts-namespace" in bwrap_info:
+    if UTS_NS in bwrap_info:
         nsent_args.append("--uts")
-    if "cgroup-namespace" in bwrap_info:
+    if CGROUP_NS in bwrap_info:
         nsent_args.append("--cgroup")
 
     if wd := SB.get("chdir"):
@@ -607,10 +612,10 @@ def enter_existing_ns(bwrap_info: dict) -> NoReturn:
 
 # ENTRY
 #################################
-CONFIGS_SOURCES: list[tuple[str,str]] = []  # contains (passed-option, value) tuples, e.g. ('name', 'value-for-name'), ('json', '{"some-key":"some-val"}')
+CONFIGS_SOURCES: list[tuple[str,str]] = []  # contains (passed-option, value) tuples, e.g. ('id', 'value-for-id'), ('json', '{"some-key":"some-val"}')
 parser = argparse.ArgumentParser()
 parser.add_argument("-l", "--log-level", choices=[lvl.lower() for lvl in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")])
-parser.add_argument("-n", "--name", action=tagged_append("name", CONFIGS_SOURCES))  # can be a comma-separated list
+parser.add_argument("-i", "--id", action=tagged_append("id", CONFIGS_SOURCES))  # can be a comma-separated list
 parser.add_argument("-j", "--json", action=tagged_append("json", CONFIGS_SOURCES))
 parser.add_argument("-f", "--file", action=tagged_append("file", CONFIGS_SOURCES))  # needs to be yaml file!
 parser.add_argument("-s", "--set", action=tagged_append("set", CONFIGS_SOURCES))
@@ -632,10 +637,10 @@ for global_path in (SB_CONFIG / "config.yaml", SB_CONFIG / "config.yml"):
 CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a single sandbox config
 for source_type, source_data in CONFIGS_SOURCES:
     match source_type:
-        case "name":
-            for name in [n.strip() for n in source_data.split(",")]:
-                if name:
-                    CONFIGS.append(load_sandbox(name))
+        case "id":
+            for id in (i.strip() for i in source_data.split(",")):
+                if id:
+                    CONFIGS.append(load_sandbox(id))
         case "json":
             CONFIGS.append(json.loads(source_data))
         case "file":
@@ -682,7 +687,7 @@ APP_BASE: str = "org.bubblebox"  # note app name needs to contain '.' in it for 
 INSTANCE_ID: str = f"{APP_BASE}-{os.getpid()}"
 DEFAULT_VARS: dict[str, str] = {
     "instance_id": INSTANCE_ID,
-    "home": HOME,  # if using prefix home, then prefer using ~
+    "home": HOME,  # if using prefix home, then prefer using ~ instead
     "xdg_runtime": XDG_RUNTIME,
     "xdg_config": str(XDG_CONFIG),
     "xdg_data": os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"),
@@ -708,7 +713,7 @@ if SB.get("disableSandbox") is True:
     os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
 
 BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
-SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("name")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance
+SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("id")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance
 if SB.get("singleton") is True and (bwrap_info := get_running_instance_bwrapinfo()):
     LOGGER.debug(f"existing bwrap instance (from {SINGLETON_LOCATION}): {bwrap_info}")
     enter_existing_ns(bwrap_info)
@@ -718,8 +723,8 @@ BWRAP_ARGS += setup_dbus_proxy(SB)
 BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, thus we dont want any previous
                                     # fork()s after this, as open files & other resources would get duplicated
 if SB.get("singleton") is True:
-    if not SB.get("name"):
-        raise Exception("singleton=True set, but no [name] attr configured")
+    if not SB.get("id"):
+        raise Exception("singleton=True set, but no [id] attr configured")
     os.makedirs(os.path.dirname(SINGLETON_LOCATION), exist_ok=True)
     with open(SINGLETON_LOCATION, "w") as f:
         f.write(BWRAP_INFOF)
