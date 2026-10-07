@@ -38,8 +38,9 @@ class SafeDict(UserDict):
 LOGGER: logging.Logger = logging.getLogger()
 
 HOME: str = os.environ["HOME"]
+UID: str = str(os.getuid())
 XDG_CONFIG: Path = Path(os.environ.get("XDG_CONFIG_HOME", f"{HOME}/.config"))
-XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{UID}")
 
 SB_CONFIG: Path = XDG_CONFIG / "bubblebox"
 
@@ -86,7 +87,7 @@ MERGE_POLICIES: dict[str, set[str]] = {
                 "dbus.sandbox.*", "dbus.policies.*", "dbus.user.policies.*",
                 "dbus.system.policies.*"}),
   "list": BWRAP_LIST_OPTIONS
-        .union({"extraArgs", "matches"}),
+        .union({"extraArgs", "extraArgsPost", "matches"}),
   "literal-expandable": {"env.*", "vars.*"},
   "dict": {"vars", "env", "dbus", "dbus.sandbox", "dbus.policies",
            "dbus.user.policies", "dbus.system.policies", "dbus.user", "dbus.system",
@@ -349,7 +350,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
             if not value.get("raw"):
                 content = content.format(**format_vars)  # TODO: instead of .format(), invoke our expand()?
 
-            if value.get("base64"):
+            if value.get("base64") is True:
                 content = base64.b64decode(content)
             else:
                 content = content.encode("utf-8")
@@ -429,7 +430,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
                 for lower in overlay["lower"]:
                     args += ("--overlay-src", lower.format(**format_vars))  # TODO: instead of .format(), invoke our expand()?
-                mode = overlay.get("mode", "rw" if "upper" in overlay and "work" in overlay else "tmp")
+                mode = overlay.get("mode", "rw" if ("upper" in overlay and "work" in overlay) else "tmp")
                 if mode == "rw":
                     args += ("--overlay", overlay["upper"], overlay["work"], dest_path)  # i.e. --overlay RWSRC WORKDIR DEST
                 else:
@@ -443,6 +444,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
     # TODO: is sorting for chmod needed? note it's sorting lexicographically by the first element's (ie. key); not length
     for path, mode in sorted(sb["chmod"].items()):
         args += ("--chmod", str(mode), path.format(**format_vars))
+    args += (arg.format(**format_vars) for arg in sb.get("extraArgsPost", ()))  # TODO: instead of .format(), invoke our expand()?
     return args
 
 
@@ -568,14 +570,16 @@ def get_running_instance_bwrapinfo() -> dict|None:
         with open(bwrap_infof, "r") as f:
             info: dict = json.loads(f.read())
             # sanity checks:
+            child_pid_key = "child-pid"
             expected_bwrap_keys: set[str] = {MNT_NS, PID_NS, NET_NS, IPC_NS,
-                                             UTS_NS, CGROUP_NS, "child-pid"}
+                                             UTS_NS, CGROUP_NS, child_pid_key}
             bwrap_info_keys: set[str] = set(info.keys())
+            min_keys = 2  # at least child-pid and one namespace expected
             if not bwrap_info_keys.issubset(expected_bwrap_keys):
-                raise Exception(f"bwrap_info contains unexpected keys: {bwrap_info_keys-expected_bwrap_keys}")
-            elif len(bwrap_info_keys) < 2:  # at least child-pid and one namespace
-                raise Exception(f"bwrap_info contains only {len(bwrap_info_keys)} key(s), expected at least 2")
-        if bwrap_proc := process_active(info["child-pid"]):
+                raise Exception(f"bwrap_info contains unexpected keys: {bwrap_info_keys - expected_bwrap_keys}")
+            elif len(bwrap_info_keys) < min_keys:
+                raise Exception(f"bwrap_info contains only {len(bwrap_info_keys)} key(s), expected at least {min_keys}")
+        if bwrap_proc := process_active(info[child_pid_key]):
             info["bwrap_proc"] = bwrap_proc
             return info
     except IOError:
@@ -671,6 +675,7 @@ if ARGS.autoload:
     if (sb := try_load_sandbox(EXECUTABLE_NAME)) and sb not in CONFIGS:
         CONFIGS.append(sb)
 
+# TODO: do we want to utilize the 'matches' logic when given ID(s) is/are given via -i flag?
 if not ARGS.no_match:
     for gs in GLOBAL_SANDBOXES:
         if EXECUTABLE_NAME in gs.get("matches", ()) and gs not in CONFIGS:
@@ -688,6 +693,7 @@ INSTANCE_ID: str = f"{APP_BASE}-{os.getpid()}"
 DEFAULT_VARS: dict[str, str] = {
     "instance_id": INSTANCE_ID,
     "home": HOME,  # if using prefix home, then prefer using ~ instead
+    "uid": UID,
     "xdg_runtime": XDG_RUNTIME,
     "xdg_config": str(XDG_CONFIG),
     "xdg_data": os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"),
