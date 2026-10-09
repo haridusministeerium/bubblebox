@@ -19,6 +19,7 @@ import sys
 import yaml
 import fcntl
 import psutil
+import signal
 
 
 # allows for stacking env vars, e.g. multiple profiles having
@@ -94,6 +95,26 @@ MERGE_POLICIES: dict[str, set[str]] = {
            "dbus.rules", "dbus.user.rules", "dbus.system.rules"},
   "discard": {"include"},
 }
+
+
+# CPython ignores SIGPIPE and SIGXFSZ at startup, and ignored signals are
+# inherited across exec().
+# cpython does this so writing to an abandoned pipe wouldn't be killed by
+# SIGPIPE (the default), but instead fail with EPIPE, which py turns into
+# BrokenPipeError; similar for SIGXFSZ.
+#
+# Restore defaults so sandboxed processes behave
+# as they would when launched from a normal shell.
+#
+# Without restoring the signal handling here, starting an interactive shell
+# (e.g. bash) in a sandbox via this script might show errors like
+# "bash: export: write error: Broken pipe"
+#
+# Note to find ignored signals, run `grep SigIgn /proc/$$/status` on host & in
+# sandbox; if the values are same, then all should be OK.
+def restore_default_signals() -> None:
+    for sig in (signal.SIGPIPE, signal.SIGXFSZ):
+        signal.signal(sig, signal.SIG_DFL)
 
 
 # TODO: should we also do os.path.expandvars() ?
@@ -523,6 +544,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 
     if os.fork() == 0:
         os.close(pr)
+        restore_default_signals()
         os.execlp(dbus_proxy_args[0], *dbus_proxy_args)
     else:
         os.close(pw)
@@ -611,6 +633,7 @@ def enter_existing_ns(bwrap_info: dict) -> NoReturn:
 
     nsent_args += ("--", EFFECTIVE_EXEC, *ARGS.args)
     LOGGER.debug("nsenter command: %s\n", shlex.join(nsent_args))
+    restore_default_signals()
     os.execlp(nsent_args[0], *nsent_args)
 
 
@@ -716,6 +739,7 @@ debug_object("sandbox", SB)
 # TODO: consider removing this option; although this allows us to use matches: key
 #       in config to selectively disable sandboxing for select commands...
 if SB.get("disableSandbox") is True:
+    restore_default_signals()
     os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
 
 BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
@@ -737,6 +761,7 @@ if SB.get("singleton") is True:
 
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
                                                ["--", EFFECTIVE_EXEC] + ARGS.args))
+restore_default_signals()
 os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS), "--", EFFECTIVE_EXEC, *ARGS.args)
 
 # TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten
