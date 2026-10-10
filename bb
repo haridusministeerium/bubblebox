@@ -214,7 +214,12 @@ def merge(a: dict[str, Any], b: dict[str, Any], format_env: SafeDict, path: list
                 res[k] = (list(left.items()) if isinstance(left, dict) else left) + \
                          (list(right.items()) if isinstance(right, dict) else right)
             case "dict":
-                res[k] = merge(a.get(k, {}), b.get(k, {}), format_env, key_path)
+                # an empty yaml key (e.g. `user:` under dbus) loads as None; treat it as empty mapping
+                left, right = (({} if side.get(k) is None else side[k]) for side in (a, b))
+                for side in (left, right):
+                    if not isinstance(side, dict):
+                        raise Exception(f"config key [{".".join(path + [k])}] must be a mapping, got: {side!r}")
+                res[k] = merge(left, right, format_env, key_path)
             case "literal":
                 res[k] = b.get(k, a.get(k))
             case "literal-expandable":

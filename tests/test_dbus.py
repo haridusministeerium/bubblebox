@@ -118,11 +118,29 @@ def test_missing_bus_socket(bb):
     bb.fails("-i", "p", TARGET, match=f"user dbus socket [{bb.xdg_runtime}/bus] does not exist")
 
 
-@pytest.mark.parametrize("profile", [
-    {"dbus": None},
-    {"dbus": {"user": None}},
-    {"env": None},
-], ids=["dbus", "dbus.user", "env"])
-def test_empty_dict_key_is_a_misconfiguration(bb, user_bus, profile):
+def test_empty_bus_key(bb, user_bus):
+    bb.profile("p", {"dbus": {"user": None}})
+    res = bb.run("-i", "p", TARGET)
+    assert res.only("xdg-dbus-proxy")["argv"][1:] == [f"unix:path={user_bus}", f"{proxy_dir(bb, res)}/user", "--filter"]
+
+
+def test_null_dbus_block(bb):
+    bb.profile("p", {"dbus": None})
+    bb.fails("-i", "p", TARGET, match="empty [dbus] key/block not allowed")
+
+
+def test_null_dict_keys_are_treated_as_empty(bb, user_bus):
+    bb.profile("a", {"env": {"A": "1"}, "dbus": {"user": {"policies": {"org.a": "talk"}}}})
+    bb.profile("b", {"env": None, "vars": None, "dbus": {"user": None}})
+    res = bb.run("-i", "a,b", TARGET)
+    assert res.bwrap.setenv["A"] == "1"
+    assert res.only("xdg-dbus-proxy")["argv"][-1] == "--talk=org.a"
+
+
+@pytest.mark.parametrize("profile, key, got", [
+    ({"dbus": {"user": {"policies": []}}}, "dbus.user.policies", "[]"),
+    ({"env": "x"}, "env", "'x'"),
+], ids=["dbus.user.policies", "env"])
+def test_non_mapping_dict_key_is_rejected(bb, profile, key, got):
     bb.profile("p", profile)
-    bb.fails("-i", "p", TARGET, match="Traceback")
+    bb.fails("-i", "p", TARGET, match=f"config key [{key}] must be a mapping, got: {got}")
