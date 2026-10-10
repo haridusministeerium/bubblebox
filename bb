@@ -117,6 +117,11 @@ def restore_default_signals() -> None:
         signal.signal(sig, signal.SIG_DFL)
 
 
+def exec(file: str, *args) -> NoReturn:
+    restore_default_signals()
+    os.execlp(file, *args)
+
+
 # TODO: should we also do os.path.expandvars() ?
 def expand(var: str, fmt: dict) -> str:
     return os.path.expanduser(var.format(**fmt))
@@ -140,7 +145,7 @@ def load_sandboxes_file(path: Path|str, default_id: str|None=None) -> list[dict]
 
 
 def try_load_sandbox(id: str) -> dict|None:
-    if id == "config":  # global app config
+    if id == "config":  # global app config filename, illegal name for individual configs
         raise Exception(f"profile/config id cannot be [{id}]")
     elif id in SANDBOXES_CACHE:
         return SANDBOXES_CACHE[id]
@@ -544,8 +549,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 
     if os.fork() == 0:
         os.close(pr)
-        restore_default_signals()
-        os.execlp(dbus_proxy_args[0], *dbus_proxy_args)
+        exec(dbus_proxy_args[0], *dbus_proxy_args)
     else:
         os.close(pw)
         assert os.read(pr, 1) == b"x"
@@ -633,8 +637,7 @@ def enter_existing_ns(bwrap_info: dict) -> NoReturn:
 
     nsent_args += ("--", EFFECTIVE_EXEC, *ARGS.args)
     LOGGER.debug("nsenter command: %s\n", shlex.join(nsent_args))
-    restore_default_signals()
-    os.execlp(nsent_args[0], *nsent_args)
+    exec(nsent_args[0], *nsent_args)
 
 
 # ENTRY
@@ -739,8 +742,7 @@ debug_object("sandbox", SB)
 # TODO: consider removing this option; although this allows us to use matches: key
 #       in config to selectively disable sandboxing for select commands...
 if SB.get("disableSandbox") is True:
-    restore_default_signals()
-    os.execlp(ARGS.executable, ARGS.executable, *ARGS.args)
+    exec(ARGS.executable, ARGS.executable, *ARGS.args)
 
 BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
 SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("id")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance
@@ -761,8 +763,7 @@ if SB.get("singleton") is True:
 
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
                                                ["--", EFFECTIVE_EXEC] + ARGS.args))
-restore_default_signals()
-os.execlp("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS), "--", EFFECTIVE_EXEC, *ARGS.args)
+exec("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS), "--", EFFECTIVE_EXEC, *ARGS.args)
 
 # TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten
 # TODO: consider renaming 'path' key in mount config to 'src'

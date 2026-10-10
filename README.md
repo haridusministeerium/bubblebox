@@ -1,12 +1,17 @@
 # bubblebox
-Process sandboxing using bubblewrap
 
-The original version was stolen from [@sloonz's gist](https://gist.github.com/sloonz/ef282a1f53366e1ed6f5cb848de015ba)
+Process sandboxing using [bubblewrap](https://github.com/containers/bubblewrap).
+It's a single file python executable that reads sandbox profile definitions
+from yaml config files (configuration also possible via options/flags), and
+composes a `bwrap` command to execute given process in a Linux-namespace sandboxed
+environment. To that end, it really is a glorified bwrap-launcher.
 
-Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubblebox)
+The original version was stolen from [this @sloonz's gist](https://gist.github.com/sloonz/ef282a1f53366e1ed6f5cb848de015ba).
+
+Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubblebox) -- they're not related.
 
 
-## Articles/blogs/discussions
+## Articles/blogs/discussions around sandboxing
 
 - [Let's discuss sandbox isolation](https://www.shayon.dev/post/2026/52/lets-discuss-sandbox-isolation/) - blog post from Feb '26
 - [one sandboxing blog post](https://www.standingpad.org/posts/2023/08/sandboxing-time/)
@@ -15,7 +20,7 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 - https://dev.to/uenyioha/37-vulnerabilities-exposed-across-15-ai-ides-the-threat-model-every-agent-builder-must-understand-3f5
 
 
-# see also
+# see also/related/alternatives
 
 - [gvisor](https://gvisor.dev/)
   - shields container workloads;
@@ -114,29 +119,22 @@ Not to be confused with [RalfJung/bubblebox](https://github.com/RalfJung/bubbleb
 # other resources
 
 - another [instruction](https://github.com/hemashushu/docker-archlinux-gui#sound-related-parameters)
-  demonstrating running GUI apps via docker/namespaces
+  demonstrating running GUI apps via docker/namespaces;
 
 
 ## TODO
 
-- create config validator. also unknown config keys shouldn't simply be
-  ignored, but should result in an exception
-- to the validation end, consider pydantic, but past experience suggests it
-  adds non-insignificant delay to startup. perhaps `TypedDict`? even better, try
-  TypedDict [with pydantic](https://pydantic.dev/docs/validation/latest/concepts/performance/#use-typeddict-over-nested-models),
-  using its `TypeAdapter`;
+- create yaml config validator. also unknown config keys shouldn't simply be
+  ignored, but should result in an exception (already should though, as the
+  missing merge keys in `MERGE_POLICIES` would cause an error);
+  - to the validation end, consider `pydantic`, but past experience suggests it
+    adds non-insignificant delay to startup. perhaps `TypedDict`? even better, try
+    TypedDict [with pydantic](https://pydantic.dev/docs/validation/latest/concepts/performance/#use-typeddict-over-nested-models),
+    using its `TypeAdapter`;
 - why do we use camel-case in config only having to convert it to kebab
   used by bwrap via bwrap_name()? would make everyone's lives easier by using kebab everywhere.
 - do we want to add `--json-status-fd FD` (e.g. replace or add in addition to
-  existing `--info-fd FD`) to bwrap?
-- how to make `xdg-dbus-proxy` work if it's _not_ sandboxed?
-- more of a config/taste question, but is there any point in binding separate
-  `~/.cache`, given we already have private HOME?
-- verify seccomp & add rules
-- to enter already-created ns w/ another process, do
-  `nsenter --preserve-credentials --user --env --mount --pid --net -t 3487436`
-  where 3487436 is --info-fd file's `child-pid` + 1; i.e. child-pid points
-  to the bwrap process, but we want the first process started _from_ it; to see
-  whether to pass --mount, --net, --ipc et al, check the same file and which
-  namespace IDs it contains (but we won't need the IDs themselves)
+  existing `--info-fd FD`) to bwrap command?
+- how to make `xdg-dbus-proxy` work if it itself is _not_ sandboxed?
+- verify existing seccomp rule, and add additional ones;
 
