@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # bb uses PEP 701 f-strings, so 3.12 is the minimum
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor, which breaks bwrap
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        env:
+          BB_REQUIRE_REAL_BWRAP: "1"
+        run: python -m pytest -v

@@ -1,0 +1,208 @@
+# Trimmed-down copy of a real-world ~/.config/bubblebox/config.yaml, used by
+# test_example_config.py. Keeps the structure and feature usage (include
+# chains, stacked env, portal data mounts, sandboxed dbus proxy, singleton,
+# matches/disableSandbox) while dropping most of the individual binds.
+---
+id: base-simple
+clearenv: true
+dieWithParent: true
+unsharePid: true
+mounts:
+  /proc: proc
+  /dev: dev
+  /tmp: tmpfs
+  /etc: ro-bind
+  /usr: ro-bind
+  /bin: {symlink: usr/bin}
+  /lib: {symlink: usr/lib}
+  /lib64: {symlink: usr/lib64}
+  /opt: ro-bind
+  "~": tmpfs
+  "{xdg_config}": dir
+  "{xdg_cache}": dir
+  "{xdg_data}": dir
+  "{xdg_state}": dir
+  "{xdg_runtime}": {tmpfs: {perms: 700}}
+  /run/systemd/resolve: ro-bind-try
+  /etc/ssh/ssh_config.d: tmpfs
+env:
+  SSH_AGENT_PID: false
+  PATH: true
+  LANG: true
+  XDG_RUNTIME_DIR: true
+  TERM: true
+  HOME: true
+  BB_SANDBOXED: "TRUE"
+  TMUX: false
+# CVE-2017-5226 (TIOCSTI/TIOCLINUX ioctl) prevention
+seccomp:
+  - arch: x86_64
+    data: |-
+     IAAAAAQAAAAVAAAMPgAAwCAAAAAAAAAANQAAAQAAAEAVAAAJ/////xUAAAYQAAAAIAAAABwAAABU
+     AAAAAAAAABUAAAMAAAAAIAAAABgAAAAVAAIAHFQAABUAAQASVAAABgAAAAAA/38GAAAAAAAAgAYA
+     AAAAAAAA
+vars:
+  flatpakInfo: |-
+    [Application]
+    name={fqname}
+    [Instance]
+    instance-id={instance_id}
+---
+id: base
+include: [base-simple, app-configs]
+mounts:
+  "{xdg_data}/fonts": ro-bind
+  "{xdg_cache}/fontconfig": bind
+  "~/.gtkrc-2.0": ro-bind-try
+  "~/.local/bin": ro-bind
+---
+id: app-configs
+env:
+  EDITOR: true
+mounts:
+  "{xdg_config}/git": ro-bind
+  "{xdg_cache}/vifm": bind-create
+---
+id: shell
+env:
+  HISTFILE: true
+mounts:
+  "~/.zshenv": ro-bind
+---
+id: display
+env:
+  XKB_DEFAULT_LAYOUT: custom
+mounts:
+  "{xdg_cache}/mesa_shader_cache": bind-try
+---
+id: x11
+include: [display]
+env:
+  DISPLAY: true
+mounts:
+  /tmp/.X11-unix/X0: ro-bind
+---
+id: audio
+mounts:
+  "{xdg_runtime}/pulse/native": ro-bind
+  "{xdg_runtime}/pipewire-0": ro-bind
+---
+id: drm
+mounts:
+  /dev/dri: dev-bind
+  /sys: ro-bind
+---
+id: portal
+mounts:
+  "{xdg_runtime}/doc": "bind-try:{xdg_runtime}/doc/by-app/{fqname}"
+  "{xdg_runtime}/at-spi": ro-bind-try
+  /.flatpak-info: {data: {content: "{flatpakInfo}", ro: true}}
+  "{xdg_runtime}/flatpak-info": {data: {content: "{flatpakInfo}", ro: true}}
+  /usr/bin: {overlay: {lower: ["/usr/bin"], mode: "tmp"}}
+  # base64 of: #!/bin/sh\nexec "$@"\n
+  /usr/bin/flatpak-spawn: {data: {perms: 500, base64: true, ro: true, content: "IyEvYmluL3NoCmV4ZWMgIiRAIgo="}}
+extraArgsPost:
+  - --remount-ro
+  - /usr/bin
+dbus:
+  sandbox:
+    include: [base]
+    asPid1: true
+    mounts:
+      /.flatpak-info: {data: {content: "{flatpakInfo}", ro: true}}
+      "{xdg_runtime}/flatpak-info": {data: {content: "{flatpakInfo}", ro: true}}
+  user:
+    policies:
+      org.freedesktop.portal.*: talk
+      org.mozilla.firefox.*: own
+    rules:
+      broadcast:
+        org.freedesktop.portal.*: "@/org/freedesktop/portal/*"
+      call:
+        org.freedesktop.portal.*: "*"
+        org.freedesktop.Notifications: "@/org/freedesktop/Notifications"
+---
+id: private-home
+include: [base]
+mounts:
+  "~": "bind-create:{xdg_data}/bubblebox/homes/{name}"
+---
+id: path-shim
+vars:
+  shims: "{xdg_data}/bubblebox/common/PATH-shims"
+env:
+  PATH: "{shims}:{PATH}"
+mounts:
+  "{shims}": ro-bind
+---
+id: py
+vars:
+  pipx_bin_dir: "~/.local/pipx-bin"
+  uv_bin_dir: "~/.local/uv-bin"
+env:
+  PIPX_BIN_DIR: "{pipx_bin_dir}"
+  PATH: "{pipx_bin_dir}:{uv_bin_dir}:{PATH}"
+mounts:
+  "{pipx_bin_dir}": "bind-create:{xdg_data}/bubblebox/common/pipx/bin"
+  "{uv_bin_dir}": "bind-create:{xdg_data}/bubblebox/common/uv/bin"
+---
+id: node
+vars:
+  npm_prefix_dir: "{xdg_data}/npm"
+env:
+  NPM_CONFIG_PREFIX: "{npm_prefix_dir}"
+  PATH: "{npm_prefix_dir}/bin:{PATH}"
+mounts:
+  "~/.npm": "bind-create:{xdg_data}/bubblebox/common/npm"
+---
+id: claude-common
+env:
+  DISABLE_AUTOUPDATER: 1
+  CLAUDE_CONFIG_DIR: "{claude_home}"
+mounts:
+  "{claude_home}": bind-create
+  "~/.claude": "symlink:{claude_home}"
+---
+id: cli
+include: [private-home, py, node]
+matches: [node, npx, npm]
+vars:
+  name: cli
+chdir: "{cwd}"
+mounts:
+  "{cwd}": bind
+---
+id: dev-common
+singleton: true
+clearenv: false
+include: [private-home, x11, drm, portal, claude-common, shell, py, node, path-shim]
+vars:
+  gradle-dir: "{xdg_config}/gradle"
+  host-shared-common: "{xdg_runtime}/shared"
+  container-sock: "unix://{host-shared-common}/podman.sock"
+env:
+  GRADLE_USER_HOME: "{gradle-dir}"
+  DOCKER_HOST: "{container-sock}"
+  SERENA_HOME: "{xdg_config}/serena"
+mounts:
+  "{host-shared-common}": "ro-bind:{xdg_data}/bubblebox/host-shared/common"
+  "~/.ssh/main.pub": "ro-bind:{xdg_data}/bubblebox/common/ssh/{ssh_pubkey}"
+  "{gradle-dir}": bind
+  "~/.gradle": "symlink:{gradle-dir}"
+  "{env[SERENA_HOME]}": "bind-create:{xdg_data}/bubblebox/common/serena"
+---
+id: dev-personal
+include: [dev-common]
+vars:
+  name: dev-personal
+  claude_home: "{xdg_config}/claude/personal"
+  ssh_pubkey: personal.pub
+mounts:
+  "/data/dev": bind
+---
+id: none
+matches: [gedit, foot, sbx-unsandboxed]
+disableSandbox: true
+---
+id: default
+include: [base, x11, audio, portal]
