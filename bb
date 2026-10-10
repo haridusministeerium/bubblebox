@@ -29,11 +29,31 @@ class SafeDict(UserDict):
     # makes sure missing format key does not throw KeyError, but leaves the format unexpanded;
     # this also means get() should be invoked on instances of this dict only w/ format_map()
     def __missing__(self, key):
-        return "{" + key + "}"
+        return Unresolved(key)
 
     def __setitem__(self, key, value):
         if isinstance(value, (str, int, float)) and not isinstance(value, bool):  # note we don't store bools either (bool is subclass of int!)
             super().__setitem__(key, os.path.expanduser(str(value)))
+
+
+# Stand-in for a missing format key that renders back to its original
+# placeholder. A plain "{key}" string wouldn't do: format_map() goes on to
+# apply any index/attribute access to it, e.g. "{env[HOME]}" would index the
+# string "{env}" and blow up, instead of being left for get_sandbox() to expand.
+class Unresolved:
+    def __init__(self, expr: str):
+        self.expr = expr
+
+    def __getitem__(self, key) -> "Unresolved":
+        return Unresolved(f"{self.expr}[{key}]")
+
+    def __getattr__(self, name: str) -> "Unresolved":
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return Unresolved(f"{self.expr}.{name}")
+
+    def __format__(self, spec: str) -> str:
+        return "{" + self.expr + (f":{spec}" if spec else "") + "}"
 
 
 LOGGER: logging.Logger = logging.getLogger()

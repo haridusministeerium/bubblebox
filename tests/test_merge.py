@@ -189,9 +189,39 @@ def test_sandbox_env_usable_in_mount_keys_and_options(bb):
     assert res.bwrap.has("--tmpfs", f"/h/{bb.home}")
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="bug: SafeDict.__missing__ returns the string '{env}', so "
-                          "'{env[X]}' in env/vars values raises TypeError while merging")
-def test_env_reference_in_env_value(bb):
-    bb.profile("p", {"env": {"X": "{env[HOME]}/x"}})
-    assert bb.run("-i", "p", TARGET).bwrap.setenv["X"] == f"{bb.home}/x"
+def test_env_reference_in_env_and_vars_values(bb):
+    bb.profile("a", {"env": {"PATH": "/a:{PATH}", "BASE": "{home}/base"}})
+    bb.profile("b", {
+        "vars": {"v": "{env[BASE]}/v"},
+        "env": {
+            "HOST_HOME": "{env[HOME]}/x",
+            "FROM_SANDBOX_ENV": "{env[BASE]}/sub",
+            "FROM_VAR": "{v}",
+            "MIXED": "{env[BASE]}:{PATH}",
+            "INHERITED": True,
+            "FROM_INHERITED": "{env[INHERITED]}!",
+        },
+    })
+    res = bb.run("-i", "a,b", TARGET, env={"INHERITED": "host-val"})
+    base = f"{bb.home}/base"
+    assert res.bwrap.setenv == {
+        "PATH": f"/a:{bb.env['PATH']}",
+        "BASE": base,
+        "HOST_HOME": f"{bb.home}/x",
+        "FROM_SANDBOX_ENV": f"{base}/sub",
+        "FROM_VAR": f"{base}/v",
+        "MIXED": f"{base}:/a:{bb.env['PATH']}",
+        "INHERITED": "host-val",
+        "FROM_INHERITED": "host-val!",
+    }
+
+
+def test_undefined_env_reference(bb):
+    bb.profile("p", {"env": {"X": "{env[UNDEFINED_VAR]}"}})
+    bb.fails("-i", "p", TARGET, match="circular def")
+
+
+def test_unresolved_placeholders_keep_format_spec(bb):
+    bb.profile("p", {"vars": {"w": "{later:>5}"}, "env": {"W": "[{w}]"}})
+    bb.profile("q", {"vars": {"later": "ab"}})
+    assert bb.run("-i", "p,q", TARGET).bwrap.setenv["W"] == "[   ab]"
