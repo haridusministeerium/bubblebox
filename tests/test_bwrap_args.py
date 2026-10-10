@@ -133,10 +133,10 @@ def test_bind_dict(bb):
     assert (bb.xdg_data / "created").is_dir()
 
 
-@pytest.mark.xfail(strict=True, reason="bug: fd mounts omit the destination path bwrap requires")
 def test_fd_mount(bb):
-    res = run_profile(bb, {"mounts": {"/f": {"fd": {"fd": 7, "ro": True}}}})
+    res = run_profile(bb, {"mounts": {"/f": {"fd": {"fd": 7, "ro": True}}, "/g": {"fd": {"fd": 8}}}})
     assert res.bwrap.has("--ro-bind-fd", "7", "/f")
+    assert res.bwrap.has("--bind-fd", "8", "/g")
 
 
 def test_file_and_data_mounts(bb):

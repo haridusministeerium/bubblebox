@@ -445,7 +445,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
                     os.makedirs(src_path, exist_ok=True)
                 args += (f"--{prefix}bind{suffix}", src_path, dest_path)
             elif (fd := mount.get("fd")) is not None:  # { fd: { fd: number; ro?: boolean }}
-                args += ("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"]))
+                args += ("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"]), dest_path)
             elif (file := mount.get("file")) is not None:  # { file: DataSource & { perms?: number }}
                 args += get_perms(file)
                 args += ("--file", format_datasource_value(file), dest_path)
