@@ -118,8 +118,11 @@ def test_missing_bus_socket(bb):
     bb.fails("-i", "p", TARGET, match=f"user dbus socket [{bb.xdg_runtime}/bus] does not exist")
 
 
-@pytest.mark.xfail(strict=True, reason="bug: an empty bus key (None) crashes merge() before "
-                                       "get_dbus_proxy_args' `or {}` fallback is reached")
-def test_empty_bus_key(bb, user_bus):
-    bb.profile("p", {"dbus": {"user": None}})
-    bb.run("-i", "p", TARGET).only("xdg-dbus-proxy")
+@pytest.mark.parametrize("profile", [
+    {"dbus": None},
+    {"dbus": {"user": None}},
+    {"env": None},
+], ids=["dbus", "dbus.user", "env"])
+def test_empty_dict_key_is_a_misconfiguration(bb, user_bus, profile):
+    bb.profile("p", profile)
+    bb.fails("-i", "p", TARGET, match="Traceback")
