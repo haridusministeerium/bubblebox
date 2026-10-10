@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 # bwrap options whose following arg is an FD that bb filled via pipefd()
-DATA_FD_OPTS = {"--seccomp", "--file", "--bind-data", "--ro-bind-data"}
+DATA_FD_OPTS = {"--seccomp", "--add-seccomp-fd", "--file", "--bind-data", "--ro-bind-data"}
 
 
 def record(name: str, payload: dict) -> None:

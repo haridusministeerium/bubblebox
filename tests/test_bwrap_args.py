@@ -25,9 +25,11 @@ def test_flags_are_kebab_cased_and_false_omitted(bb):
 
 def test_options(bb):
     res = run_profile(bb, {"argv0": "x-{exe_name}", "userns2": 5, "uid": 1000, "hostname": "h",
-                           "chdir": "{home}/w", "infoFd": False, "jsonStatusFd": 9})
+                           "chdir": "{home}/w", "infoFd": False, "jsonStatusFd": 9,
+                           "usernsBlockFd": 4})
     for seq in (("--argv0", f"x-{TARGET}"), ("--userns2", "5"), ("--uid", "1000"),
-                ("--hostname", "h"), ("--chdir", f"{bb.home}/w"), ("--json-status-fd", "9")):
+                ("--hostname", "h"), ("--chdir", f"{bb.home}/w"), ("--json-status-fd", "9"),
+                ("--userns-block-fd", "4")):
         assert res.bwrap.has(*seq), seq
     assert "False" not in res.bwrap.args  # false-valued options are omitted
 
@@ -212,3 +214,16 @@ def test_seccomp_single_dict_and_fd(bb):
 def test_seccomp_arch_errors(bb, progs, error):
     bb.profile("p", {"seccomp": progs})
     bb.fails("-i", "p", TARGET, match=error)
+
+
+def test_add_seccomp_fd_accepts_programs_and_fds(bb):
+    b64 = lambda data: base64.b64encode(data).decode()
+    res = run_profile(bb, {"addSeccompFd": [
+        {"arch": platform.machine(), "data": b64(b"prog1")},
+        77,
+        [{"arch": "not-this-arch", "data": b64(b"other")}, {"arch": platform.machine(), "data": b64(b"prog2")}],
+    ]})
+    fds = res.bwrap.values("--add-seccomp-fd")
+    assert len(fds) == 3 and fds[1] == "77"
+    assert res.bwrap.fd_content(fds[0]) == b"prog1"
+    assert res.bwrap.fd_content(fds[2]) == b"prog2"

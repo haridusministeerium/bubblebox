@@ -387,10 +387,10 @@ def get_bwrap_args(sb: dict) -> list[str]:
 
     # TODO: what are the possible 'value' types? is it dict|list|int|str?
     def format_option_value(opt_name: str, value) -> str:
-        if opt_name in ("seccomp", "addSeccomp"):
+        if opt_name in ("seccomp", "addSeccompFd"):
             return format_seccomp_value(value)
         elif opt_name in ("userns", "userns2", "pidns", "syncFd", "blockFd",
-                          "userNsBlockFd", "infoFd", "jsonStatusFd"):
+                          "usernsBlockFd", "infoFd", "jsonStatusFd"):
             return str(value)
         return str(value).format(**format_vars)  # TODO: instead of .format(), invoke our expand()?
 
