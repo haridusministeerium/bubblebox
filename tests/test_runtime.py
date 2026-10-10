@@ -19,6 +19,12 @@ def test_disable_sandbox_execs_directly(bb):
     assert int(call["sigign"], 16) & SIGPIPE_SIGXFSZ == 0
 
 
+def test_disable_sandbox_without_executable_runs_shell(bb):
+    res = bb.run("-s", "disableSandbox=true", env={"SHELL": str(bb.fakebin / UNSANDBOXED)})
+    assert res.calls("bwrap") == []
+    assert res.only(UNSANDBOXED)["argv"] == []
+
+
 def test_signals_restored_before_exec_of_bwrap(bb):
     bb.profile("default", {})
     assert bb.run(TARGET).bwrap.sigign & SIGPIPE_SIGXFSZ == 0
@@ -114,6 +120,7 @@ def test_singleton_ignores_dead_instance(bb):
 @pytest.mark.parametrize("info, error", [
     ({"child-pid": 1, "bogus": 1}, "bwrap_info contains unexpected keys"),
     ({"child-pid": 1}, "bwrap_info contains only 1 key(s)"),
+    ({"mnt-namespace": 1, "pid-namespace": 2}, "lacks [child-pid] key"),
 ])
 def test_singleton_rejects_malformed_bwrapinfo(bb, info, error):
     path = bb.root / "bwrapinfo.json"
@@ -122,3 +129,17 @@ def test_singleton_rejects_malformed_bwrapinfo(bb, info, error):
     instance_file(bb, "solo").write_text(str(path))
     bb.profile("solo", {"id": "solo", "singleton": True})
     bb.fails("-i", "solo", TARGET, match=error)
+
+
+def test_singleton_ignores_unparsable_bwrapinfo(bb):
+    # left behind when bwrap failed at startup, before writing its info
+    info = bb.root / "bwrapinfo.json"
+    info.touch()
+    instance_file(bb, "solo").parent.mkdir()
+    instance_file(bb, "solo").write_text(str(info))
+    bb.profile("solo", {"id": "solo", "singleton": True})
+
+    res = bb.run("-i", "solo", TARGET)
+    assert f"ignoring unparsable bwrap info file [{info}] of a previous [solo] instance" in res.stderr
+    assert res.calls("nsenter") == []
+    assert instance_file(bb, "solo").read_text() == res.bwrap.info_fd_target

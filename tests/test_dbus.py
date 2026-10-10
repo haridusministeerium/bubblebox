@@ -1,5 +1,6 @@
 """xdg-dbus-proxy setup driven by the [dbus] block."""
 import os
+import shutil
 
 import pytest
 
@@ -144,3 +145,30 @@ def test_null_dict_keys_are_treated_as_empty(bb, user_bus):
 def test_non_mapping_dict_key_is_rejected(bb, profile, key, got):
     bb.profile("p", profile)
     bb.fails("-i", "p", TARGET, match=f"config key [{key}] must be a mapping, got: {got}")
+
+
+@pytest.fixture
+def path_without_proxy(bb, tmp_path):
+    """PATH holding just the fakes and the tools their wrappers need, minus xdg-dbus-proxy."""
+    (bb.fakebin / "xdg-dbus-proxy").unlink()
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for tool in ("grep", "cut"):
+        (tools / tool).symlink_to(shutil.which(tool))
+    return f"{bb.fakebin}:{tools}"
+
+
+def test_missing_dbus_proxy_binary(bb, user_bus, path_without_proxy):
+    bb.profile("p", {"dbus": {"user": {}}})
+    res = bb.fails("-i", "p", TARGET, env={"PATH": path_without_proxy},
+                   match="xdg-dbus-proxy exited before signalling it's ready")
+    assert "failed to start [xdg-dbus-proxy]: [Errno 2] No such file or directory" in res.stderr
+    assert res.calls("bwrap") == []
+
+
+def test_dbus_proxy_exiting_early(bb, user_bus):
+    proxy = bb.fakebin / "xdg-dbus-proxy"
+    proxy.write_text("#!/bin/sh\nexit 1\n")
+    bb.profile("p", {"dbus": {"user": {}}})
+    res = bb.fails("-i", "p", TARGET, match="xdg-dbus-proxy exited before signalling it's ready")
+    assert res.calls("bwrap") == []

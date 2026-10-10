@@ -461,7 +461,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 args += get_perms(dir)
                 args += ("--dir", dest_path)
             elif (symlink := mount.get("symlink")) is not None:  # { symlink: string }
-                args += ("--symlink", symlink.format(**format_vars), dest_path)  # TODO: instead of .format(), invoke our expand()?
+                args += ("--symlink", expand(symlink, format_vars), dest_path)
             elif (bind := mount.get("bind")) is not None:  # { bind: { path: string; ro?: boolean; dev?: boolean; try?: boolean, create?: boolean }}
                 prefix = "dev-" if bind.get("dev") else "ro-" if bind.get("ro") else ""
                 suffix = "-try" if bind.get("try") else ""
@@ -480,10 +480,11 @@ def get_bwrap_args(sb: dict) -> list[str]:
                          format_datasource_value(data), dest_path)
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
                 for lower in overlay["lower"]:
-                    args += ("--overlay-src", lower.format(**format_vars))  # TODO: instead of .format(), invoke our expand()?
+                    args += ("--overlay-src", expand(lower, format_vars))
                 mode = overlay.get("mode", "rw" if ("upper" in overlay and "work" in overlay) else "tmp")
                 if mode == "rw":
-                    args += ("--overlay", overlay["upper"], overlay["work"], dest_path)  # i.e. --overlay RWSRC WORKDIR DEST
+                    args += ("--overlay", expand(overlay["upper"], format_vars),  # i.e. --overlay RWSRC WORKDIR DEST
+                             expand(overlay["work"], format_vars), dest_path)
                 else:
                     args += (f"--{mode}-overlay", dest_path)
             else:
@@ -574,10 +575,15 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 
     if os.fork() == 0:
         os.close(pr)
-        exec(dbus_proxy_args[0], *dbus_proxy_args)
+        try:
+            exec(dbus_proxy_args[0], *dbus_proxy_args)
+        except OSError as e:
+            print(f"failed to start [{dbus_proxy_args[0]}]: {e}", file=sys.stderr)
+            os._exit(127)  # don't unwind into the parent's code in this forked child
     else:
         os.close(pw)
-        assert os.read(pr, 1) == b"x"
+        if os.read(pr, 1) != b"x":  # proxy writes a byte to --fd once it's listening
+            raise Exception("xdg-dbus-proxy exited before signalling it's ready")
         return ["--sync-fd", str(pr)] + cmd_bwrap_args
 
 
@@ -619,22 +625,36 @@ def get_running_instance_bwrapinfo() -> dict|None:
         with open(SINGLETON_LOCATION, "r") as f:
             bwrap_infof = f.read()
         with open(bwrap_infof, "r") as f:
-            info: dict = json.loads(f.read())
-            # sanity checks:
-            child_pid_key = "child-pid"
-            expected_bwrap_keys: set[str] = {MNT_NS, PID_NS, NET_NS, IPC_NS,
-                                             UTS_NS, CGROUP_NS, child_pid_key}
-            bwrap_info_keys: set[str] = set(info.keys())
-            min_keys = 2  # at least child-pid and one namespace expected
-            if not bwrap_info_keys.issubset(expected_bwrap_keys):
-                raise Exception(f"bwrap_info contains unexpected keys: {bwrap_info_keys - expected_bwrap_keys}")
-            elif len(bwrap_info_keys) < min_keys:
-                raise Exception(f"bwrap_info contains only {len(bwrap_info_keys)} key(s), expected at least {min_keys}")
-        if bwrap_proc := process_active(info[child_pid_key]):
-            info["bwrap_proc"] = bwrap_proc
-            return info
+            content = f.read()
     except IOError:
-        pass
+        return None
+
+    # the instance file is written before bwrap starts, so the info file stays
+    # empty if bwrap failed at startup; treat it as no running instance, or
+    # every later launch of this profile would fail
+    try:
+        info: dict = json.loads(content)
+    except json.JSONDecodeError:
+        LOGGER.warning("ignoring unparsable bwrap info file [%s] of a previous [%s] instance",
+                       bwrap_infof, SB.get("id"))
+        return None
+
+    # sanity checks:
+    child_pid_key = "child-pid"
+    expected_bwrap_keys: set[str] = {MNT_NS, PID_NS, NET_NS, IPC_NS,
+                                     UTS_NS, CGROUP_NS, child_pid_key}
+    bwrap_info_keys: set[str] = set(info.keys())
+    min_keys = 2  # at least child-pid and one namespace expected
+    if not bwrap_info_keys.issubset(expected_bwrap_keys):
+        raise Exception(f"bwrap_info contains unexpected keys: {bwrap_info_keys - expected_bwrap_keys}")
+    elif len(bwrap_info_keys) < min_keys:
+        raise Exception(f"bwrap_info contains only {len(bwrap_info_keys)} key(s), expected at least {min_keys}")
+    elif child_pid_key not in info:
+        raise Exception(f"bwrap_info [{bwrap_infof}] lacks [{child_pid_key}] key")
+
+    if bwrap_proc := process_active(info[child_pid_key]):
+        info["bwrap_proc"] = bwrap_proc
+        return info
 
 
 # TODO: lacking seccomp filters; consider re-adding, or migrating to gvisor?
@@ -767,7 +787,7 @@ debug_object("sandbox", SB)
 # TODO: consider removing this option; although this allows us to use matches: key
 #       in config to selectively disable sandboxing for select commands...
 if SB.get("disableSandbox") is True:
-    exec(ARGS.executable, ARGS.executable, *ARGS.args)
+    exec(EFFECTIVE_EXEC, EFFECTIVE_EXEC, *ARGS.args)
 
 BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
 SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("id")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance

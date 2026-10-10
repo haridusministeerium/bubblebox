@@ -227,3 +227,13 @@ def test_add_seccomp_fd_accepts_programs_and_fds(bb):
     assert len(fds) == 3 and fds[1] == "77"
     assert res.bwrap.fd_content(fds[0]) == b"prog1"
     assert res.bwrap.fd_content(fds[2]) == b"prog2"
+
+
+def test_overlay_and_symlink_paths_are_expanded(bb):
+    res = run_profile(bb, {"mounts": {
+        "/ov": {"overlay": {"lower": ["~/l"], "upper": "{home}/up", "work": "~/wk"}},
+        "/s": {"symlink": "~/t"},
+    }})
+    h = bb.home
+    assert res.bwrap.has("--overlay-src", f"{h}/l", "--overlay", f"{h}/up", f"{h}/wk", "/ov")
+    assert res.bwrap.has("--symlink", f"{h}/t", "/s")
