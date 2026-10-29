@@ -79,6 +79,36 @@ def test_singleton_instance_named_after_effective_id(bb):
     assert not instance_file(bb, "base").exists()
 
 
+@pytest.mark.parametrize("args", [
+    ("-i", "solo", "-s", "@include=base"),
+    ("-s", "@include=base", "-i", "solo"),
+    ("-i", "solo", "-j", '{"id": "base"}'),
+])
+def test_singleton_id_from_cli_profile_wins_over_later_sources(bb, args):
+    bb.profile("base", {"id": "base"})
+    bb.profile("solo", {"id": "solo", "singleton": True})
+    bb.run(*args, TARGET)
+    assert instance_file(bb, "solo").is_file()
+    assert not instance_file(bb, "base").exists()
+
+
+def test_singleton_id_from_matched_profile_does_not_override_cli_profile(bb):
+    bb.global_config({"id": "m", "matches": [TARGET]})
+    bb.profile("solo", {"id": "solo", "singleton": True})
+    bb.run("-i", "solo", TARGET)
+    assert instance_file(bb, "solo").is_file()
+    assert not instance_file(bb, "m").exists()
+
+
+def test_singleton_id_from_last_cli_profile_with_id(bb):
+    bb.profile("a", {"id": "a", "singleton": True})
+    bb.profile("b", {"id": "b"})
+    bb.profile("anon", {})
+    bb.run("-i", "a,b,anon", TARGET)
+    assert instance_file(bb, "b").is_file()
+    assert not instance_file(bb, "a").exists()
+
+
 def test_singleton_requires_id(bb):
     bb.fails("-j", '{"singleton": true}', TARGET, match="singleton=True set, but no [id] attr configured")
     # the profile's file name is only a lookup key; it does not set [id]

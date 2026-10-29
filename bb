@@ -710,12 +710,14 @@ for global_path in (SB_CONFIG / "config.yaml", SB_CONFIG / "config.yml"):
         GLOBAL_SANDBOXES += load_sandboxes_file(global_path)
 
 CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a single sandbox config
+CLI_ID_CONFIGS: list[dict] = []  # subset of CONFIGS selected via -i
 for source_type, source_data in CONFIGS_SOURCES:
     match source_type:
         case "id":
             for id in (i.strip() for i in source_data.split(",")):
                 if id:
-                    CONFIGS.append(load_sandbox(id))
+                    CONFIGS.append(sb := load_sandbox(id))
+                    CLI_ID_CONFIGS.append(sb)
         case "json":
             CONFIGS.append(json.loads(source_data))
         case "file":
@@ -782,6 +784,12 @@ DEFAULT_VARS: dict[str, str] = {
 }
 
 SB: dict = get_sandbox(merge_sandboxes(CONFIGS, SafeDict(**os.environ, **DEFAULT_VARS)))
+# [id] keys the singleton instance, so a profile picked via -i owns it even when a later
+# source (e.g. `-s @include=base`, a global `matches` profile) also sets an [id]:
+for sb in reversed(CLI_ID_CONFIGS):
+    if id := merge_sandboxes([sb], SafeDict()).get("id"):
+        SB["id"] = id
+        break
 debug_object("sandbox", SB)
 
 # TODO: consider removing this option; although this allows us to use matches: key
