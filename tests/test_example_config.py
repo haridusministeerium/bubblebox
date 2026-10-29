@@ -112,7 +112,7 @@ def test_dev_personal(example):
     assert a.setenv["PATH"] == (f"{d}/bubblebox/common/PATH-shims:{d}/npm/bin:"
                                 f"{h}/.local/pipx-bin:{h}/.local/uv-bin:{bb.env['PATH']}")
     assert (cfg / "claude/personal").is_dir()
-    assert (rt / "bubblebox/dev-personal.instance.info").read_text() == a.info_fd_target
+    assert (rt / "bubblebox/dev-personal.instance.info").read_text().split("\n")[0] == a.info_fd_target
 
 
 def test_unsandboxed_match(example):

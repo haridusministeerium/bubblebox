@@ -4,6 +4,7 @@
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -623,7 +624,7 @@ def process_active(pid: int) -> psutil.Process|None:
 def get_running_instance_bwrapinfo() -> dict|None:
     try:
         with open(SINGLETON_LOCATION, "r") as f:
-            bwrap_infof = f.read()
+            bwrap_infof, _, config_hash = f.read().partition("\n")
         with open(bwrap_infof, "r") as f:
             content = f.read()
     except IOError:
@@ -654,6 +655,7 @@ def get_running_instance_bwrapinfo() -> dict|None:
 
     if bwrap_proc := process_active(info[child_pid_key]):
         info["bwrap_proc"] = bwrap_proc
+        info["config_hash"] = config_hash
         return info
 
 
@@ -799,8 +801,15 @@ if SB.get("disableSandbox") is True:
 
 BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
 SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("id")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance
+# nsenter can't apply config, so refuse to enter an instance started from a different one.
+# Hashed before vars/env expansion, which differs per run (instance_id, cwd, host env).
+CONFIG_HASH: str = hashlib.sha256(json.dumps(merge_sandboxes(CONFIGS, SafeDict()), sort_keys=True,
+                                             default=str).encode()).hexdigest() if SB.get("singleton") is True else ""
 if SB.get("singleton") is True and (bwrap_info := get_running_instance_bwrapinfo()):
     LOGGER.debug(f"existing bwrap instance (from {SINGLETON_LOCATION}): {bwrap_info}")
+    if bwrap_info["config_hash"] != CONFIG_HASH:
+        raise Exception(f"running [{SB["id"]}] singleton instance was started with a different config; "
+                        "exit it first, or drop the config changes (extra -i/-j/-f/-s/-a, edited profiles)")
     enter_existing_ns(bwrap_info)
 
 BWRAP_ARGS: list[str] = get_bwrap_args(SB)
@@ -812,7 +821,7 @@ if SB.get("singleton") is True:
         raise Exception("singleton=True set, but no [id] attr configured")
     os.makedirs(os.path.dirname(SINGLETON_LOCATION), exist_ok=True)
     with open(SINGLETON_LOCATION, "w") as f:
-        f.write(BWRAP_INFOF)
+        f.write(f"{BWRAP_INFOF}\n{CONFIG_HASH}")
 
 LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
                                                ["--", EFFECTIVE_EXEC] + ARGS.args))
