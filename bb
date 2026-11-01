@@ -23,6 +23,12 @@ import psutil
 import signal
 
 
+BIND_RE = re.compile(
+    r"(?P<opt>(?:ro-|dev-)?bind(?:-try)?)"  # bind / ro-bind-try / dev-bind ...
+    r"(?P<create>(?<!-try)-create)?"        # optional -create, but not after -try
+    r"(?::(?P<src>\S.*))?$"                 # optional ":source_path"
+)
+
 # allows for stacking env vars, e.g. multiple profiles having
 # PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars; i.e.
 # can extend/stack as opposed to overwriting previous values
@@ -441,15 +447,13 @@ def get_bwrap_args(sb: dict) -> list[str]:
         # - it covers also '-try' or '-create' suffixes;
         # - the '-create' suffix is our own convention and will be stripped from final flag;
         #   it creates the SRC dir if it doesn't exist
-        elif isinstance(mount, str) and re.match(r"(ro-|dev-)?bind(-try|-create)?(:\S|$)", mount):
+        elif isinstance(mount, str) and (m := BIND_RE.match(mount)):
             src_path = dest_path
-            if ":" in mount:
-                mount, src_path = mount.split(":", 1)
-                src_path = expand(src_path, format_vars)
-            if mount.endswith("-create"):
-                mount = mount.removesuffix("-create")
+            if m["src"] is not None:
+                src_path = expand(m["src"], format_vars)
+            if m["create"]:
                 os.makedirs(src_path, exist_ok=True)
-            args += (f"--{mount}", src_path, dest_path)
+            args += (f"--{m['opt']}", src_path, dest_path)
         elif isinstance(mount, str) and mount.startswith("symlink:"):
             args += ("--symlink", expand(mount.removeprefix("symlink:"), format_vars), dest_path)
         elif isinstance(mount, dict):
@@ -480,6 +484,7 @@ def get_bwrap_args(sb: dict) -> list[str]:
                 args += ("--ro-bind-data" if data.get("ro") else "--bind-data",
                          format_datasource_value(data), dest_path)
             elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
+                # --overly-src specifies a host path from which files should be read if they aren't present in a higher layer.
                 for lower in overlay["lower"]:
                     args += ("--overlay-src", expand(lower, format_vars))
                 mode = overlay.get("mode", "rw" if ("upper" in overlay and "work" in overlay) else "tmp")
@@ -487,6 +492,8 @@ def get_bwrap_args(sb: dict) -> list[str]:
                     args += ("--overlay", expand(overlay["upper"], format_vars),  # i.e. --overlay RWSRC WORKDIR DEST
                              expand(overlay["work"], format_vars), dest_path)
                 else:
+                    if "upper" in overlay or "work" in overlay:
+                        raise Exception("tmp- or ro- overlay does not accept [upper] nor [work] configs/dirs")
                     args += (f"--{mode}-overlay", dest_path)
             else:
                 raise Exception(f"invalid mount value: {repr(mount)}")
