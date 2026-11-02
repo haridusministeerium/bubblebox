@@ -174,6 +174,50 @@ def test_overlays(bb):
                          "--overlay", "/up", "/wk", "/rw")
 
 
+def test_overlay_shorthands(bb):
+    res = run_profile(bb, {"mounts": {
+        "/t1": "overlay-tmp",
+        "/t2": "overlay-tmp:{home}/src",
+        "/r1": "overlay-ro",
+        "/r2": "overlay-ro:/lower",
+    }})
+    assert res.bwrap.has("--overlay-src", "/t1", "--tmp-overlay", "/t1")
+    assert res.bwrap.has("--overlay-src", f"{bb.home}/src", "--tmp-overlay", "/t2")
+    assert res.bwrap.has("--overlay-src", "/r1", "--ro-overlay", "/r1")
+    assert res.bwrap.has("--overlay-src", "/lower", "--ro-overlay", "/r2")
+
+
+def test_overlay_auto(bb):
+    root = bb.xdg_data / "ov"
+    res = run_profile(bb, {"vars": {"olay_root": "{xdg_data}/ov"}, "mounts": {
+        "~/a": "overlay-auto",
+        "/b": "overlay-auto-create:~/lower",
+        "/c": "overlay-auto:/usr/share",
+        "/d": "overlay-auto:/home/other/x",
+    }})
+    a, b, c, d = root / "~/a", root / "~/lower", root / "root/usr/share", root / "home/other/x"
+    assert res.bwrap.has("--overlay-src", f"{bb.home}/a",
+                         "--overlay", f"{a}/upper", f"{a}/.work", f"{bb.home}/a")
+    assert res.bwrap.has("--overlay-src", f"{bb.home}/lower",
+                         "--overlay", f"{b}/upper", f"{b}/.work", "/b")
+    assert res.bwrap.has("--overlay-src", "/usr/share", "--overlay", f"{c}/upper", f"{c}/.work", "/c")
+    assert res.bwrap.has("--overlay-src", "/home/other/x", "--overlay", f"{d}/upper", f"{d}/.work", "/d")
+    assert not a.exists()
+    for p in (b / "upper", b / ".work"):
+        assert p.is_dir()
+
+
+@pytest.mark.parametrize("value", ["overlay-tmp-create", "overlay-ro-create"])
+def test_overlay_create_only_valid_for_auto(bb, value):
+    bb.profile("p", {"mounts": {"/x": value}})
+    bb.fails("-i", "p", TARGET, match="invalid mount")
+
+
+def test_overlay_auto_requires_olay_root(bb):
+    bb.profile("p", {"mounts": {"/x": "overlay-auto"}})
+    bb.fails("-i", "p", TARGET, match="[olay_root] var needs to be defined")
+
+
 @pytest.mark.parametrize("mount, error", [
     ({"bogus": 1}, "invalid mount value"),
     (5, "invalid mount (of type <class 'int'>)"),

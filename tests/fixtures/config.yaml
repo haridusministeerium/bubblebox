@@ -42,6 +42,7 @@ seccomp:
      AAAAAAAAABUAAAMAAAAAIAAAABgAAAAVAAIAHFQAABUAAQASVAAABgAAAAAA/38GAAAAAAAAgAYA
      AAAAAAAA
 vars:
+  olay_root: "{xdg_data}/bubblebox/common/overlays"
   flatpakInfo: |-
     [Application]
     name={fqname}

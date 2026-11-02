@@ -29,6 +29,12 @@ BIND_RE = re.compile(
     r"(?::(?P<src>\S.*))?$"                 # optional ":source_path"
 )
 
+OVERLAY_RE = re.compile(
+    r"overlay-(?P<mode>tmp|ro|auto)"        # overlay-tmp / overlay-ro / overlay-auto
+    r"(?P<create>(?<=auto)-create)?"        # optional -create, only after -auto
+    r"(?::(?P<src>\S.*))?$"                 # optional ":source_path"
+)
+
 # allows for stacking env vars, e.g. multiple profiles having
 # PATH: "/some/dir:{PATH}" while _still_ allowing for later-expanded vars; i.e.
 # can extend/stack as opposed to overwriting previous values
@@ -152,6 +158,17 @@ def exec(file: str, *args) -> NoReturn:
 # TODO: should we also do os.path.expandvars() ?
 def expand(var: str, fmt: dict) -> str:
     return os.path.expanduser(var.format(**fmt))
+
+
+# maps an overlay's lower dir to its relative location under [olay_root]:
+# $HOME/x -> ~/x; /home/x -> home/x; /x -> root/x
+def overlay_dir_key(path: str) -> str:
+    path = os.path.normpath(path)
+    if path == HOME or path.startswith(HOME + "/"):
+        return "~" + path.removeprefix(HOME)
+    if path == "/home" or path.startswith("/home/"):
+        return path.lstrip("/")
+    return "root" + path.rstrip("/")
 
 
 def tagged_append(tag: str, dest: list[tuple[str,str]]):
@@ -454,6 +471,25 @@ def get_bwrap_args(sb: dict) -> list[str]:
             if m["create"]:
                 os.makedirs(src_path, exist_ok=True)
             args += (f"--{m['opt']}", src_path, dest_path)
+        # 'overlay' convenience w/ a single lower dir (defaults to DEST); '--overlay-auto'
+        # places upper & work dirs under the [olay_root] var, keyed by the lower dir;
+        # '--overlay-auto-create' also creates them
+        elif isinstance(mount, str) and (m := OVERLAY_RE.match(mount)):
+            src_path = dest_path
+            if m["src"] is not None:
+                src_path = expand(m["src"], format_vars)
+            args += ("--overlay-src", src_path)
+            if m["mode"] == "auto":
+                if "olay_root" not in format_vars:
+                    raise Exception(f"[olay_root] var needs to be defined for [{mount}] mount at [{dest_path}]")
+                olay_dir = os.path.join(expand(format_vars["olay_root"], format_vars), overlay_dir_key(src_path))
+                upper, work = os.path.join(olay_dir, "upper"), os.path.join(olay_dir, ".work")
+                if m["create"]:
+                    os.makedirs(upper, exist_ok=True)
+                    os.makedirs(work, exist_ok=True)
+                args += ("--overlay", upper, work, dest_path)
+            else:
+                args += (f"--{m['mode']}-overlay", dest_path)
         elif isinstance(mount, str) and mount.startswith("symlink:"):
             args += ("--symlink", expand(mount.removeprefix("symlink:"), format_vars), dest_path)
         elif isinstance(mount, dict):
