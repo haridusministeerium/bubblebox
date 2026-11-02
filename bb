@@ -18,7 +18,6 @@ import re
 import shlex
 import sys
 import yaml
-import fcntl
 import psutil
 import signal
 
@@ -79,14 +78,16 @@ XDG_RUNTIME: str = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{UID}")
 SB_CONFIG: Path = XDG_CONFIG / "bubblebox"
 
 SANDBOXES_CACHE: dict[str, dict] = {}
-GLOBAL_SANDBOXES: list[dict] = []
 
-MNT_NS: str = "mnt-namespace"
-PID_NS: str = "pid-namespace"
-NET_NS: str = "net-namespace"
-IPC_NS: str = "ipc-namespace"
-UTS_NS: str = "uts-namespace"
-CGROUP_NS: str = "cgroup-namespace"
+# bwrap info-fd namespace key -> (/proc/<pid>/ns/ entry, nsenter flag)
+NAMESPACES: dict[str, tuple[str, str]] = {
+    "mnt-namespace": ("mnt", "--mount"),
+    "pid-namespace": ("pid", "--pid"),
+    "net-namespace": ("net", "--net"),
+    "ipc-namespace": ("ipc", "--ipc"),
+    "uts-namespace": ("uts", "--uts"),
+    "cgroup-namespace": ("cgroup", "--cgroup"),
+}
 
 
 BWRAP_FLAGS: set[str] = {"levelPrefix", "unshareAll", "shareNet", "unshareUser",
@@ -281,8 +282,7 @@ def merge_sandboxes(sandboxes: Iterable[dict], format_env: SafeDict) -> dict:
                 return {}
             return load_sandboxes_file(path)[0]
 
-        # TODO: should we not raise a proper error here?
-        assert False
+        raise Exception(f"include entry needs an [id] or [path] key: {inc_in!r}")
 
     res = {}
     for sb in sandboxes:
@@ -294,7 +294,7 @@ def merge_sandboxes(sandboxes: Iterable[dict], format_env: SafeDict) -> dict:
 # note passed sb is the final/merged/resolved sandbox config
 #
 # returns enriched sandbox with env/vars/mounts/chmod data
-def get_sandbox(sb: dict) -> dict:
+def get_sandbox(sb: dict, default_vars: dict[str, str]) -> dict:
     # Parse vars & env
     raw_env: dict = {}
     env: dict = {}
@@ -330,8 +330,7 @@ def get_sandbox(sb: dict) -> dict:
                     raw_env[k] = v["value"]
             else:
                 raise Exception(f"Invalid value for environment variable {k}: {repr(v)}")
-        # TODO: int,float shouldn't occur anymore due to SafeDict, right?:
-        elif isinstance(v, (int, float)):
+        elif isinstance(v, (int, float)):  # e.g. yaml `FOO: 5`; SafeDict only coerces merge-time format values
             raw_env[k] = str(v)
         else:
             raise Exception(f"Invalid value for environment variable {k}: {repr(v)}")
@@ -340,7 +339,7 @@ def get_sandbox(sb: dict) -> dict:
     # string.format() method, passing **format_vars as possible values to
     # be expanded into the raw values
     raw_vars: dict = {**sb.get("vars", {})}
-    vars: dict = {**DEFAULT_VARS}
+    vars: dict = {**default_vars}
     format_vars: dict = {**vars, "env": {**os.environ, **env}}
     while True:
         changed: bool = False
@@ -374,7 +373,7 @@ def pipefd(data: bytes) -> str:
     if os.fork() == 0:
         os.close(pr)
         os.write(pw, data)
-        sys.exit(0)  # immediately exit the child process
+        os._exit(0)  # don't unwind into the parent's code in this forked child
     else:
         os.close(pw)
         return str(pr)
@@ -382,6 +381,54 @@ def pipefd(data: bytes) -> str:
 
 def pipefd_args(args: list[str]) -> str:
     return pipefd("\0".join(args).encode("utf-8"))
+
+
+# turns string mount shorthands into their equivalent dict form
+def normalize_mount(mount: Any) -> Any:
+    if not isinstance(mount, str):
+        return mount
+    if mount in ("tmpfs", "dir"):
+        return {mount: {}}
+    if mount.startswith("symlink:"):
+        return {"symlink": mount.removeprefix("symlink:")}
+    # '-try' and '-create' suffixes; '-create' is our own convention: it creates the SRC dir if missing
+    if m := BIND_RE.match(mount):
+        opt: str = m["opt"]
+        return {"bind": {"ro": opt.startswith("ro-"), "dev": opt.startswith("dev-"),
+                         "try": opt.endswith("-try"), "create": bool(m["create"]),
+                         **({"path": m["src"]} if m["src"] is not None else {})}}
+    if m := OVERLAY_RE.match(mount):
+        return {"overlay": {"mode": m["mode"], "create": bool(m["create"]),
+                            **({"lower": [m["src"]]} if m["src"] is not None else {})}}
+    return mount
+
+
+# { overlay: { lower?: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" | "auto"; create?: boolean }}
+# lower defaults to DEST; 'auto' mode places upper & work dirs under the [olay_root] var, keyed by
+# the (single) lower dir, and 'create' creates them
+def get_overlay_args(overlay: dict, dest_path: str, format_vars: dict) -> list[str]:
+    lowers: list[str] = [expand(l, format_vars) for l in overlay["lower"]] if "lower" in overlay else [dest_path]
+    args: list[str] = []
+    for lower in lowers:  # host paths from which files are read if they aren't present in a higher layer
+        args += ("--overlay-src", lower)
+    mode: str = overlay.get("mode", "rw" if ("upper" in overlay and "work" in overlay) else "tmp")
+    if mode != "rw" and ("upper" in overlay or "work" in overlay):
+        raise Exception(f"{mode} overlay does not accept [upper] nor [work] configs/dirs")
+    if mode == "rw":
+        upper, work = expand(overlay["upper"], format_vars), expand(overlay["work"], format_vars)
+    elif mode == "auto":
+        if "olay_root" not in format_vars:
+            raise Exception(f"[olay_root] var needs to be defined for auto overlay mount at [{dest_path}]")
+        if len(lowers) != 1:
+            raise Exception(f"auto overlay at [{dest_path}] needs exactly one lower dir, got {len(lowers)}")
+        olay_dir = os.path.join(expand(format_vars["olay_root"], format_vars), overlay_dir_key(lowers[0]))
+        upper, work = os.path.join(olay_dir, "_ol_upper"), os.path.join(olay_dir, "._ol_work")
+        if overlay.get("create") is True:
+            os.makedirs(upper, exist_ok=True)
+            os.makedirs(work, exist_ok=True)
+    else:
+        return args + [f"--{mode}-overlay", dest_path]
+    return args + ["--overlay", upper, work, dest_path]  # i.e. --overlay RWSRC WORKDIR DEST
 
 
 # resolve bwrap flags from given sandbox config
@@ -416,14 +463,14 @@ def get_bwrap_args(sb: dict) -> list[str]:
         elif opt_name in ("userns", "userns2", "pidns", "syncFd", "blockFd",
                           "usernsBlockFd", "infoFd", "jsonStatusFd"):
             return str(value)
-        return str(value).format(**format_vars)  # TODO: instead of .format(), invoke our expand()?
+        return expand(str(value), format_vars)
 
     def format_datasource_value(value) -> str:  # {fd: number} | {content: string, raw?: boolean, base64?: boolean}
         if (fd := value.get("fd")) is not None:
             return str(fd)
         elif (content := value.get("content")) is not None:
             if not value.get("raw"):
-                content = content.format(**format_vars)  # TODO: instead of .format(), invoke our expand()?
+                content = content.format(**format_vars)  # not expand(): a leading ~ in file content isn't a path
 
             if value.get("base64") is True:
                 content = base64.b64decode(content)
@@ -448,99 +495,53 @@ def get_bwrap_args(sb: dict) -> list[str]:
         for v in sb.get(o, ()):
             if v not in (False, None):
                 args += (f"--{bwrap_name(o)}", format_option_value(o, v))
-    args += (arg.format(**format_vars) for arg in sb.get("extraArgs", ()))  # TODO: instead of .format(), invoke our expand()?
+    args += (expand(arg, format_vars) for arg in sb.get("extraArgs", ()))
     for e in sb["envUnset"]:
         args += ("--unsetenv", e)
     for k, v in sb["env"].items():
         args += ("--setenv", k, v)
 
-    # note dest_path is on the sandbox side; note it's sorting lexicographically by the first element's (ie. key); not length
+    # note dest_path is on the sandbox side & already expanded by get_sandbox(), so it
+    # mustn't be expanded again; note it's sorting lexicographically by key, not length
     for dest_path, mount in sorted(sb["mounts"].items()):
-        if mount in ("proc", "dev", "tmpfs", "mqueue", "dir"):
-            # TODO: is there a need to do dest_path.format(**format_vars) anymore, given
-            #       key formatting was already done in the end of get_sandbox()?
-            args += (f"--{mount}", dest_path.format(**format_vars))  # TODO: instead of .format(), invoke our expand()?
-        # 'bind' convenience for when SRC & DEST are the same; note:
-        # - it covers also '-try' or '-create' suffixes;
-        # - the '-create' suffix is our own convention and will be stripped from final flag;
-        #   it creates the SRC dir if it doesn't exist
-        elif isinstance(mount, str) and (m := BIND_RE.match(mount)):
-            src_path = dest_path
-            if m["src"] is not None:
-                src_path = expand(m["src"], format_vars)
-            if m["create"]:
-                os.makedirs(src_path, exist_ok=True)
-            args += (f"--{m['opt']}", src_path, dest_path)
-        # 'overlay' convenience w/ a single lower dir (defaults to DEST); '--overlay-auto'
-        # places upper & work dirs under the [olay_root] var, keyed by the lower dir;
-        # '--overlay-auto-create' also creates them
-        elif isinstance(mount, str) and (m := OVERLAY_RE.match(mount)):
-            src_path = dest_path
-            if m["src"] is not None:
-                src_path = expand(m["src"], format_vars)
-            args += ("--overlay-src", src_path)
-            if m["mode"] == "auto":
-                if "olay_root" not in format_vars:
-                    raise Exception(f"[olay_root] var needs to be defined for [{mount}] mount at [{dest_path}]")
-                olay_dir = os.path.join(expand(format_vars["olay_root"], format_vars), overlay_dir_key(src_path))
-                upper, work = os.path.join(olay_dir, "upper"), os.path.join(olay_dir, ".work")
-                if m["create"]:
-                    os.makedirs(upper, exist_ok=True)
-                    os.makedirs(work, exist_ok=True)
-                args += ("--overlay", upper, work, dest_path)
-            else:
-                args += (f"--{m['mode']}-overlay", dest_path)
-        elif isinstance(mount, str) and mount.startswith("symlink:"):
-            args += ("--symlink", expand(mount.removeprefix("symlink:"), format_vars), dest_path)
-        elif isinstance(mount, dict):
-            if (tmpfs := mount.get("tmpfs")) is not None:  # { tmpfs: { perms?: number; size?: number }}
+        if mount in ("proc", "dev", "mqueue"):
+            args += (f"--{mount}", dest_path)
+            continue
+        match normalize_mount(mount):
+            case {"tmpfs": dict(tmpfs)}:  # { tmpfs: { perms?: number; size?: number }}
                 args += get_perms(tmpfs)
                 if (size := tmpfs.get("size")) is not None:
                     args += ("--size", str(size))
                 args += ("--tmpfs", dest_path)
-            elif (dir := mount.get("dir")) is not None:  # { dir: { perms?: number }}
+            case {"dir": dict(dir)}:  # { dir: { perms?: number }}
                 args += get_perms(dir)
                 args += ("--dir", dest_path)
-            elif (symlink := mount.get("symlink")) is not None:  # { symlink: string }
+            case {"symlink": str(symlink)}:  # { symlink: string }
                 args += ("--symlink", expand(symlink, format_vars), dest_path)
-            elif (bind := mount.get("bind")) is not None:  # { bind: { path: string; ro?: boolean; dev?: boolean; try?: boolean, create?: boolean }}
+            case {"bind": dict(bind)}:  # { bind: { path?: string; ro?: boolean; dev?: boolean; try?: boolean, create?: boolean }}
                 prefix = "dev-" if bind.get("dev") else "ro-" if bind.get("ro") else ""
                 suffix = "-try" if bind.get("try") else ""
-                src_path = expand(bind.get("path", dest_path), format_vars)
+                src_path = expand(bind["path"], format_vars) if "path" in bind else dest_path
                 if bind.get("create") is True:
                     os.makedirs(src_path, exist_ok=True)
                 args += (f"--{prefix}bind{suffix}", src_path, dest_path)
-            elif (fd := mount.get("fd")) is not None:  # { fd: { fd: number; ro?: boolean }}
+            case {"fd": dict(fd)}:  # { fd: { fd: number; ro?: boolean }}
                 args += ("--ro-bind-fd" if fd.get("ro") else "--bind-fd", str(fd["fd"]), dest_path)
-            elif (file := mount.get("file")) is not None:  # { file: DataSource & { perms?: number }}
+            case {"file": dict(file)}:  # { file: DataSource & { perms?: number }}
                 args += get_perms(file)
                 args += ("--file", format_datasource_value(file), dest_path)
-            elif (data := mount.get("data")) is not None:  # { data: DataSource & { ro?: boolean; perms?: number }}
+            case {"data": dict(data)}:  # { data: DataSource & { ro?: boolean; perms?: number }}
                 args += get_perms(data)
                 args += ("--ro-bind-data" if data.get("ro") else "--bind-data",
                          format_datasource_value(data), dest_path)
-            elif (overlay := mount.get("overlay")) is not None:  # { overlay: { lower: string[]; upper?: string; work?: string; mode?: "rw" | "tmp" | "ro" }}
-                # --overly-src specifies a host path from which files should be read if they aren't present in a higher layer.
-                for lower in overlay["lower"]:
-                    args += ("--overlay-src", expand(lower, format_vars))
-                mode = overlay.get("mode", "rw" if ("upper" in overlay and "work" in overlay) else "tmp")
-                if mode == "rw":
-                    args += ("--overlay", expand(overlay["upper"], format_vars),  # i.e. --overlay RWSRC WORKDIR DEST
-                             expand(overlay["work"], format_vars), dest_path)
-                else:
-                    if "upper" in overlay or "work" in overlay:
-                        raise Exception("tmp- or ro- overlay does not accept [upper] nor [work] configs/dirs")
-                    args += (f"--{mode}-overlay", dest_path)
-            else:
-                raise Exception(f"invalid mount value: {repr(mount)}")
-        else:
-            raise Exception(f"invalid mount (of type {type(mount)}) value: {repr(mount)}")
-    # TODO: is there need to do path.format(**format_vars) anymore, given
-    #       key formatting was already done in the end of get_sandbox()?
+            case {"overlay": dict(overlay)}:
+                args += get_overlay_args(overlay, dest_path, format_vars)
+            case _:
+                raise Exception(f"invalid mount (of type {type(mount)}) value: {repr(mount)}")
     # TODO: is sorting for chmod needed? note it's sorting lexicographically by the first element's (ie. key); not length
     for path, mode in sorted(sb["chmod"].items()):
-        args += ("--chmod", str(mode), path.format(**format_vars))
-    args += (arg.format(**format_vars) for arg in sb.get("extraArgsPost", ()))  # TODO: instead of .format(), invoke our expand()?
+        args += ("--chmod", str(mode), path)
+    args += (expand(arg, format_vars) for arg in sb.get("extraArgsPost", ()))
     return args
 
 
@@ -564,13 +565,13 @@ def get_dbus_proxy_args(dbus: dict, bus_name: str) -> list[str]:
 
 # if required so by the sb's config, start a xdg-dbus-proxy subprocess and
 # return additional bwrap parameters to pass to the main sandbox command
-def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
+def setup_dbus_proxy(sb: dict, instance_id: str, default_vars: dict[str, str]) -> list[str]|tuple[()]:
     if not (dbus := sb.get("dbus")):
         if "dbus" in sb:  # sanity
             raise Exception("empty [dbus] key/block not allowed")
         return ()  # no dbus proxies configured, bail
 
-    proxy_dir: str = f"{XDG_RUNTIME}/xdg-dbus-proxy/{INSTANCE_ID}"
+    proxy_dir: str = f"{XDG_RUNTIME}/xdg-dbus-proxy/{instance_id}"
 
     unix_path_prefix: str = "unix:path="
     dbus_sess_bus_env_var: str = "DBUS_SESSION_BUS_ADDRESS"
@@ -611,7 +612,7 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
     # if 'dbus.sandbox' defined, then it means xdg-dbus-proxy itself is to be ran in bwrap as well:
     # TODO: as of May '26, portals do not work if x-d-p runs unsandboxed:
     if proxy_sb := dbus.get("sandbox"):
-        proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,), SafeDict(**os.environ, **DEFAULT_VARS)))  # note we call merge_sandboxes() to get the [include] resolution/expansion
+        proxy_sb: dict = get_sandbox(merge_sandboxes((proxy_sb,), SafeDict(**os.environ, **default_vars)), default_vars)  # note we call merge_sandboxes() to get the [include] resolution/expansion
         debug_object("dbus proxy sandbox", proxy_sb)
         proxy_bwrap_args = get_bwrap_args(proxy_sb) + proxy_bwrap_args
         dbus_proxy_args = ["bwrap", "--args", pipefd_args(proxy_bwrap_args), "--"] + dbus_proxy_args
@@ -634,12 +635,11 @@ def setup_dbus_proxy(sb: dict) -> list[str]|tuple[()]:
 # for some explanation, see e.g.
 # - https://github.com/ValveSoftware/steam-for-linux/issues/10645#issuecomment-2013609605
 # - https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d#gistcomment-5515250
-def get_bwrapinfo_args() -> tuple[str, str]:
-    global INFO_FD  # so it's not gc-d prematurely
-    os.makedirs(os.path.dirname(BWRAP_INFOF), exist_ok=True)
-    INFO_FD = open(BWRAP_INFOF, "w")
-    fcntl.fcntl(INFO_FD, fcntl.F_SETFD, 0)
-    return "--info-fd", str(INFO_FD.fileno())
+def get_bwrapinfo_args(path: str) -> tuple[str, str]:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd: int = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.set_inheritable(fd, True)  # raw fd, so bwrap inherits it & nothing closes it on gc
+    return "--info-fd", str(fd)
 
 
 def debug_object(label: str, obj: object) -> None:
@@ -647,26 +647,28 @@ def debug_object(label: str, obj: object) -> None:
         LOGGER.debug(f"{label}:\n{pprint.pformat(obj)}")
 
 
-# def process_active(pid: int) -> psutil.Process|None:
-    # try:
-        # return (psutil.pid_exists(pid) and psutil.Process(pid).status()
-                # not in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE))
-    # except psutil.Error:  # includes NoSuchProcess error
-        # return None
-
-# from https://stackoverflow.com/a/74720401/1803648
 def process_active(pid: int) -> psutil.Process|None:
     try:
         process = psutil.Process(pid)
+        if process.status() not in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE):
+            return process
     except psutil.Error:  # includes NoSuchProcess error
-        return None
-    if psutil.pid_exists(pid) and process.status() not in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE):
-        return process
+        pass
+    return None
 
 
-def get_running_instance_bwrapinfo() -> dict|None:
+# guards against pid reuse: the process now at [pid] must still live in the namespaces bwrap reported
+def in_recorded_namespaces(pid: int, bwrap_info: dict) -> bool:
     try:
-        with open(SINGLETON_LOCATION, "r") as f:
+        return all(os.stat(f"/proc/{pid}/ns/{NAMESPACES[k][0]}").st_ino == bwrap_info[k]
+                   for k in bwrap_info.keys() & NAMESPACES.keys())
+    except OSError:
+        return False
+
+
+def get_running_instance_bwrapinfo(singleton_location: str, sb_id: str) -> dict|None:
+    try:
+        with open(singleton_location, "r") as f:
             bwrap_infof, _, config_hash = f.read().partition("\n")
         with open(bwrap_infof, "r") as f:
             content = f.read()
@@ -680,13 +682,12 @@ def get_running_instance_bwrapinfo() -> dict|None:
         info: dict = json.loads(content)
     except json.JSONDecodeError:
         LOGGER.warning("ignoring unparsable bwrap info file [%s] of a previous [%s] instance",
-                       bwrap_infof, SB.get("id"))
+                       bwrap_infof, sb_id)
         return None
 
     # sanity checks:
     child_pid_key = "child-pid"
-    expected_bwrap_keys: set[str] = {MNT_NS, PID_NS, NET_NS, IPC_NS,
-                                     UTS_NS, CGROUP_NS, child_pid_key}
+    expected_bwrap_keys: set[str] = {*NAMESPACES, child_pid_key}
     bwrap_info_keys: set[str] = set(info.keys())
     min_keys = 2  # at least child-pid and one namespace expected
     if not bwrap_info_keys.issubset(expected_bwrap_keys):
@@ -697,6 +698,10 @@ def get_running_instance_bwrapinfo() -> dict|None:
         raise Exception(f"bwrap_info [{bwrap_infof}] lacks [{child_pid_key}] key")
 
     if bwrap_proc := process_active(info[child_pid_key]):
+        if not in_recorded_namespaces(bwrap_proc.pid, info):
+            LOGGER.warning("ignoring stale [%s] instance: pid %s no longer runs in its recorded namespaces",
+                           sb_id, bwrap_proc.pid)
+            return None
         info["bwrap_proc"] = bwrap_proc
         info["config_hash"] = config_hash
         return info
@@ -704,175 +709,179 @@ def get_running_instance_bwrapinfo() -> dict|None:
 
 # TODO: lacking seccomp filters; consider re-adding, or migrating to gvisor?
 #       alternatively consider https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5926910#file-sandbox-py-L135-L142
-def enter_existing_ns(bwrap_info: dict) -> NoReturn:
+def enter_existing_ns(bwrap_info: dict, sb: dict, cmd: list[str]) -> NoReturn:
     child: psutil.Process = next(c for c in bwrap_info["bwrap_proc"].children())  # first child running _in_ the sandbox namespace
     nsent_args: list[str] = ["nsenter", "--preserve-credentials", "--user",
                              "--keep-caps", "--env", "--target", str(child.pid)]
+    nsent_args += (flag for k, (_, flag) in NAMESPACES.items() if k in bwrap_info)
 
-    if MNT_NS in bwrap_info:
-        nsent_args.append("--mount")
-    if PID_NS in bwrap_info:
-        nsent_args.append("--pid")
-    if NET_NS in bwrap_info:
-        nsent_args.append("--net")
-    if IPC_NS in bwrap_info:
-        nsent_args.append("--ipc")
-    if UTS_NS in bwrap_info:
-        nsent_args.append("--uts")
-    if CGROUP_NS in bwrap_info:
-        nsent_args.append("--cgroup")
+    if wd := sb.get("chdir"):
+        nsent_args.append("--wdns=" + expand(wd, sb["format_vars"]))
 
-    if wd := SB.get("chdir"):
-        nsent_args.append("--wdns=" + expand(wd, SB["format_vars"]))
-
-    nsent_args += ("--", EFFECTIVE_EXEC, *ARGS.args)
+    nsent_args += ("--", *cmd)
     LOGGER.debug("nsenter command: %s\n", shlex.join(nsent_args))
     exec(nsent_args[0], *nsent_args)
 
 
-# ENTRY
-#################################
-CONFIGS_SOURCES: list[tuple[str,str]] = []  # contains (passed-option, value) tuples, e.g. ('id', 'value-for-id'), ('json', '{"some-key":"some-val"}')
-parser = argparse.ArgumentParser()
-parser.add_argument("-l", "--log-level", choices=[lvl.lower() for lvl in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")])
-parser.add_argument("-i", "--id", action=tagged_append("id", CONFIGS_SOURCES))  # can be a comma-separated list
-parser.add_argument("-j", "--json", action=tagged_append("json", CONFIGS_SOURCES))
-parser.add_argument("-f", "--file", action=tagged_append("file", CONFIGS_SOURCES))  # needs to be yaml file!
-parser.add_argument("-s", "--set", action=tagged_append("set", CONFIGS_SOURCES))
-parser.add_argument("-a", "--autoload", action="store_true")
-parser.add_argument("-M", "--no-match", action="store_true")
-parser.add_argument("-D", "--no-default", action="store_true")
-parser.add_argument("--default-sandbox", action="store", default="default")
-parser.add_argument("executable", nargs="?")
-parser.add_argument("args", nargs=argparse.REMAINDER)
-ARGS: argparse.Namespace = parser.parse_args()
+def parse_args() -> tuple[argparse.Namespace, list[tuple[str, str]]]:
+    sources: list[tuple[str, str]] = []  # (passed-option, value) tuples in cli order, e.g. ('id', 'value-for-id'), ('json', '{"some-key":"some-val"}')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-l", "--log-level", choices=[lvl.lower() for lvl in ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")])
+    parser.add_argument("-i", "--id", action=tagged_append("id", sources))  # can be a comma-separated list
+    parser.add_argument("-j", "--json", action=tagged_append("json", sources))
+    parser.add_argument("-f", "--file", action=tagged_append("file", sources))  # needs to be yaml file!
+    parser.add_argument("-s", "--set", action=tagged_append("set", sources))
+    parser.add_argument("-a", "--autoload", action="store_true")
+    parser.add_argument("-M", "--no-match", action="store_true")
+    parser.add_argument("-D", "--no-default", action="store_true")
+    parser.add_argument("--default-sandbox", action="store", default="default")
+    parser.add_argument("executable", nargs="?")
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    return parser.parse_args(), sources
 
-if ARGS.log_level:
-    logging.basicConfig(stream=sys.stdout, level=getattr(logging, ARGS.log_level.upper()), force=True)
 
-for global_path in (SB_CONFIG / "config.yaml", SB_CONFIG / "config.yml"):
-    if global_path.is_file():
-        GLOBAL_SANDBOXES += load_sandboxes_file(global_path)
+# turns a `-s path.to.key=value` arg into a config dict
+def parse_set_arg(source_data: str) -> dict:
+    k, v = source_data.split("=", 1)
+    k = re.sub(r"^\$", "env.", re.sub(r"^:", "vars.", k))
+    v = json.loads(v) if v and (v[0] in '"[{' or v in ("true", "false", "null")) else v
+    if k in ("include", "@include") and isinstance(v, str):
+        k, v = "include", [i for i in (i.strip() for i in v.split(",")) if i]
+    obj = {}
+    cur = obj
+    for is_array, p, end in re.findall(r'(?:^|\.)(@?)("[^"=]+"|[^".=]+)(=$)?', f"{k}="):
+        p = p[1:-1] if p.startswith('"') else p
+        c = v if end else {}
+        if is_array:
+            cur[p] = [c]
+            cur = cur[p][0]
+        else:
+            cur[p] = c
+            cur = cur[p]
+    return obj
 
-CONFIGS: list[dict] = []  # active sandbox configs to use, will be merged into a single sandbox config
-CLI_ID_CONFIGS: list[dict] = []  # subset of CONFIGS selected via -i
-for source_type, source_data in CONFIGS_SOURCES:
-    match source_type:
-        case "id":
-            for id in (i.strip() for i in source_data.split(",")):
-                if id:
-                    CONFIGS.append(sb := load_sandbox(id))
-                    CLI_ID_CONFIGS.append(sb)
-        case "json":
-            CONFIGS.append(json.loads(source_data))
-        case "file":
-            CONFIGS += load_sandboxes_file(source_data)
-        case "set":
-            k, v = source_data.split("=", 1)
-            k = re.sub(r"^\$", "env.", re.sub(r"^:", "vars.", k))
-            v = json.loads(v) if v and (v[0] in '"[{' or v in ("true", "false", "null")) else v
-            if k in ("include", "@include") and isinstance(v, str):
-                k, v = "include", [i for i in (i.strip() for i in v.split(",")) if i]
-            obj = {}
-            cur = obj
-            for is_array, p, end in re.findall(r'(?:^|\.)(@?)("[^"=]+"|[^".=]+)(=$)?', f"{k}="):
-                p = p[1:-1] if p.startswith('"') else p
-                c = v if end else {}
-                if is_array:
-                    cur[p] = [c]
-                    cur = cur[p][0]
-                else:
-                    cur[p] = c
-                    cur = cur[p]
-            CONFIGS.append(obj)
-        case _:
-            raise NotImplementedError
 
-EXECUTABLE_NAME: str = os.path.basename(ARGS.executable or os.environ.get("SHELL", "sh"))
-EFFECTIVE_EXEC: str = ARGS.executable or EXECUTABLE_NAME
+# returns all active sandbox configs to be merged, and the subset of them selected via -i
+def collect_configs(args: argparse.Namespace, sources: list[tuple[str, str]],
+                    executable_name: str) -> tuple[list[dict], list[dict]]:
+    global_sandboxes: list[dict] = []
+    for global_path in (SB_CONFIG / "config.yaml", SB_CONFIG / "config.yml"):
+        if global_path.is_file():
+            global_sandboxes += load_sandboxes_file(global_path)
 
-if ARGS.autoload:
-    if (sb := try_load_sandbox(EXECUTABLE_NAME)) and sb not in CONFIGS:
-        CONFIGS.append(sb)
+    configs: list[dict] = []
+    cli_id_configs: list[dict] = []
+    for source_type, source_data in sources:
+        match source_type:
+            case "id":
+                for id in (i.strip() for i in source_data.split(",")):
+                    if id:
+                        configs.append(sb := load_sandbox(id))
+                        cli_id_configs.append(sb)
+            case "json":
+                configs.append(json.loads(source_data))
+            case "file":
+                configs += load_sandboxes_file(source_data)
+            case "set":
+                configs.append(parse_set_arg(source_data))
+            case _:
+                raise NotImplementedError
 
-# TODO: do we want to utilize the 'matches' logic when given ID(s) is/are given via -i flag?
-if not ARGS.no_match:
-    for gs in GLOBAL_SANDBOXES:
-        if EXECUTABLE_NAME in gs.get("matches", ()) and gs not in CONFIGS:
-            CONFIGS.append(gs)
+    if args.autoload:
+        if (sb := try_load_sandbox(executable_name)) and sb not in configs:
+            configs.append(sb)
 
-if not CONFIGS:
-    if ARGS.no_default:
-        raise Exception(f"no matching sandbox config(s) found, and defaulting to [{ARGS.default_sandbox}] sandbox is disallowed")
-    CONFIGS.append(load_sandbox(ARGS.default_sandbox))
+    # TODO: do we want to utilize the 'matches' logic when given ID(s) is/are given via -i flag?
+    if not args.no_match:
+        for gs in global_sandboxes:
+            if executable_name in gs.get("matches", ()) and gs not in configs:
+                configs.append(gs)
 
-debug_object("configs", CONFIGS)
+    if not configs:
+        if args.no_default:
+            raise Exception(f"no matching sandbox config(s) found, and defaulting to [{args.default_sandbox}] sandbox is disallowed")
+        configs.append(load_sandbox(args.default_sandbox))
+    return configs, cli_id_configs
 
-APP_BASE: str = "org.bubblebox"  # note app name needs to contain '.' in it for portals to work!
-INSTANCE_ID: str = f"{APP_BASE}-{os.getpid()}"
-DEFAULT_VARS: dict[str, str] = {
-    "instance_id": INSTANCE_ID,
-    "home": HOME,  # if using prefix home, then prefer using ~ instead
-    "uid": UID,
-    "xdg_runtime": XDG_RUNTIME,
-    "xdg_config": str(XDG_CONFIG),
-    "xdg_data": os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"),
-    "xdg_state": os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"),
-    "xdg_cache": os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"),
-    "cwd": os.getcwd(),
-    "exe_arg": ARGS.executable,  # str | None
-    "exe_name": EXECUTABLE_NAME,  # used to be the old name/fqname value prior to adding mandatory dot for portal (but we don't want fqname e.g. in our private-home dirname)
-    # NOTE: either allow defining default 'name' var here and make sure to use it directly in private-home profile's [mount], OR
-    #       remove default 'name' here, which would allow you to reference it in private-home's [private-home' var, e.g. [private-home: "{xdg_data}/bubblebox/homes/{name}"]
-    #       if you keep the default and reference it in another var, then you won't be able to overwrite the name, and private home dir will
-    #       always be named this default
-    "name": EXECUTABLE_NAME,
-    "fqname": f"{APP_BASE}.{EXECUTABLE_NAME}",  # fully qualified
-}
 
-SB: dict = get_sandbox(merge_sandboxes(CONFIGS, SafeDict(**os.environ, **DEFAULT_VARS)))
-# [id] keys the singleton instance, so a profile picked via -i owns it even when a later
-# source (e.g. `-s @include=base`, a global `matches` profile) also sets an [id].
-# Only an [id] set by the profile itself counts, not one inherited through its includes:
-for sb in reversed(CLI_ID_CONFIGS):
-    if id := sb.get("id"):
-        SB["id"] = id
-        break
-debug_object("sandbox", SB)
+def main() -> NoReturn:
+    args, sources = parse_args()
+    if args.log_level:
+        logging.basicConfig(stream=sys.stdout, level=getattr(logging, args.log_level.upper()), force=True)
 
-# TODO: consider removing this option; although this allows us to use matches: key
-#       in config to selectively disable sandboxing for select commands...
-if SB.get("disableSandbox") is True:
-    exec(EFFECTIVE_EXEC, EFFECTIVE_EXEC, *ARGS.args)
+    executable_name: str = os.path.basename(args.executable or os.environ.get("SHELL", "sh"))
+    cmd: list[str] = [args.executable or executable_name, *args.args]
+    configs, cli_id_configs = collect_configs(args, sources, executable_name)
+    debug_object("configs", configs)
 
-BWRAP_INFOF = f"{XDG_RUNTIME}/.flatpak/{INSTANCE_ID}/bwrapinfo.json"
-SINGLETON_LOCATION = f"{XDG_RUNTIME}/bubblebox/{SB.get("id")}.instance.info"  # file containing BWRAP_INFOF path for this profile's running instance
-# nsenter can't apply config, so refuse to enter an instance started from a different one.
-# Hashed before vars/env expansion, which differs per run (instance_id, cwd, host env).
-CONFIG_HASH: str = hashlib.sha256(json.dumps(merge_sandboxes(CONFIGS, SafeDict()), sort_keys=True,
-                                             default=str).encode()).hexdigest() if SB.get("singleton") is True else ""
-if SB.get("singleton") is True and (bwrap_info := get_running_instance_bwrapinfo()):
-    LOGGER.debug(f"existing bwrap instance (from {SINGLETON_LOCATION}): {bwrap_info}")
-    if bwrap_info["config_hash"] != CONFIG_HASH:
-        raise Exception(f"running [{SB["id"]}] singleton instance was started with a different config; "
-                        "exit it first, or drop the config changes (extra -i/-j/-f/-s/-a, edited profiles)")
-    enter_existing_ns(bwrap_info)
+    app_base: str = "org.bubblebox"  # note app name needs to contain '.' in it for portals to work!
+    instance_id: str = f"{app_base}-{os.getpid()}"
+    default_vars: dict[str, str] = {
+        "instance_id": instance_id,
+        "home": HOME,  # if using prefix home, then prefer using ~ instead
+        "uid": UID,
+        "xdg_runtime": XDG_RUNTIME,
+        "xdg_config": str(XDG_CONFIG),
+        "xdg_data": os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share"),
+        "xdg_state": os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state"),
+        "xdg_cache": os.environ.get("XDG_CACHE_HOME", f"{HOME}/.cache"),
+        "cwd": os.getcwd(),
+        "exe_arg": args.executable,  # str | None
+        "exe_name": executable_name,  # used to be the old name/fqname value prior to adding mandatory dot for portal (but we don't want fqname e.g. in our private-home dirname)
+        # NOTE: either allow defining default 'name' var here and make sure to use it directly in private-home profile's [mount], OR
+        #       remove default 'name' here, which would allow you to reference it in private-home's [private-home' var, e.g. [private-home: "{xdg_data}/bubblebox/homes/{name}"]
+        #       if you keep the default and reference it in another var, then you won't be able to overwrite the name, and private home dir will
+        #       always be named this default
+        "name": executable_name,
+        "fqname": f"{app_base}.{executable_name}",  # fully qualified
+    }
 
-BWRAP_ARGS: list[str] = get_bwrap_args(SB)
-BWRAP_ARGS += setup_dbus_proxy(SB)
-BWRAP_ARGS += get_bwrapinfo_args()  # leave this last, as it will open() a file, thus we dont want any previous
-                                    # fork()s after this, as open files & other resources would get duplicated
-if SB.get("singleton") is True:
-    if not SB.get("id"):
-        raise Exception("singleton=True set, but no [id] attr configured")
-    os.makedirs(os.path.dirname(SINGLETON_LOCATION), exist_ok=True)
-    with open(SINGLETON_LOCATION, "w") as f:
-        f.write(f"{BWRAP_INFOF}\n{CONFIG_HASH}")
+    sb: dict = get_sandbox(merge_sandboxes(configs, SafeDict(**os.environ, **default_vars)), default_vars)
+    # [id] keys the singleton instance, so a profile picked via -i owns it even when a later
+    # source (e.g. `-s @include=base`, a global `matches` profile) also sets an [id].
+    # Only an [id] set by the profile itself counts, not one inherited through its includes:
+    for cli_sb in reversed(cli_id_configs):
+        if id := cli_sb.get("id"):
+            sb["id"] = id
+            break
+    debug_object("sandbox", sb)
 
-LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap"] + BWRAP_ARGS +
-                                               ["--", EFFECTIVE_EXEC] + ARGS.args))
-exec("bwrap", "bwrap", "--args", pipefd_args(BWRAP_ARGS), "--", EFFECTIVE_EXEC, *ARGS.args)
+    # TODO: consider removing this option; although this allows us to use matches: key
+    #       in config to selectively disable sandboxing for select commands...
+    if sb.get("disableSandbox") is True:
+        exec(cmd[0], *cmd)
+
+    singleton: bool = sb.get("singleton") is True
+    bwrap_infof: str = f"{XDG_RUNTIME}/.flatpak/{instance_id}/bwrapinfo.json"
+    singleton_location: str = f"{XDG_RUNTIME}/bubblebox/{sb.get("id")}.instance.info"  # file containing bwrap_infof path for this profile's running instance
+    # nsenter can't apply config, so refuse to enter an instance started from a different one.
+    # Hashed before vars/env expansion, which differs per run (instance_id, cwd, host env).
+    config_hash: str = hashlib.sha256(json.dumps(merge_sandboxes(configs, SafeDict()), sort_keys=True,
+                                                 default=str).encode()).hexdigest() if singleton else ""
+    if singleton and (bwrap_info := get_running_instance_bwrapinfo(singleton_location, sb.get("id"))):
+        LOGGER.debug(f"existing bwrap instance (from {singleton_location}): {bwrap_info}")
+        if bwrap_info["config_hash"] != config_hash:
+            raise Exception(f"running [{sb["id"]}] singleton instance was started with a different config; "
+                            "exit it first, or drop the config changes (extra -i/-j/-f/-s/-a, edited profiles)")
+        enter_existing_ns(bwrap_info, sb, cmd)
+
+    bwrap_args: list[str] = get_bwrap_args(sb)
+    bwrap_args += setup_dbus_proxy(sb, instance_id, default_vars)
+    bwrap_args += get_bwrapinfo_args(bwrap_infof)  # leave this last, as it opens a file; we don't want any
+                                                   # fork()s after this, as the open fd would get duplicated
+    if singleton:
+        if not sb.get("id"):
+            raise Exception("singleton=True set, but no [id] attr configured")
+        os.makedirs(os.path.dirname(singleton_location), exist_ok=True)
+        with open(singleton_location, "w") as f:
+            f.write(f"{bwrap_infof}\n{config_hash}")
+
+    LOGGER.debug("bwrap command: %s\n", shlex.join(["bwrap", *bwrap_args, "--", *cmd]))
+    exec("bwrap", "bwrap", "--args", pipefd_args(bwrap_args), "--", *cmd)
+
+
+if __name__ == "__main__":
+    main()
 
 # TODO: document that 'vars' cannot contain 'env' key, as it'll get overwritten
 # TODO: consider renaming 'path' key in mount config to 'src'
-

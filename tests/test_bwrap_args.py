@@ -197,14 +197,37 @@ def test_overlay_auto(bb):
     }})
     a, b, c, d = root / "~/a", root / "~/lower", root / "root/usr/share", root / "home/other/x"
     assert res.bwrap.has("--overlay-src", f"{bb.home}/a",
-                         "--overlay", f"{a}/upper", f"{a}/.work", f"{bb.home}/a")
+                         "--overlay", f"{a}/_ol_upper", f"{a}/._ol_work", f"{bb.home}/a")
     assert res.bwrap.has("--overlay-src", f"{bb.home}/lower",
-                         "--overlay", f"{b}/upper", f"{b}/.work", "/b")
-    assert res.bwrap.has("--overlay-src", "/usr/share", "--overlay", f"{c}/upper", f"{c}/.work", "/c")
-    assert res.bwrap.has("--overlay-src", "/home/other/x", "--overlay", f"{d}/upper", f"{d}/.work", "/d")
+                         "--overlay", f"{b}/_ol_upper", f"{b}/._ol_work", "/b")
+    assert res.bwrap.has("--overlay-src", "/usr/share", "--overlay", f"{c}/_ol_upper", f"{c}/._ol_work", "/c")
+    assert res.bwrap.has("--overlay-src", "/home/other/x", "--overlay", f"{d}/_ol_upper", f"{d}/._ol_work", "/d")
     assert not a.exists()
-    for p in (b / "upper", b / ".work"):
+    for p in (b / "_ol_upper", b / "._ol_work"):
         assert p.is_dir()
+
+
+def test_overlay_auto_dict_form(bb):
+    root = bb.xdg_data / "ov"
+    res = run_profile(bb, {"vars": {"olay_root": "{xdg_data}/ov"}, "mounts": {
+        "/a": {"overlay": {"lower": ["/usr/share"], "mode": "auto", "create": True}},
+    }})
+    d = root / "root/usr/share"
+    assert res.bwrap.has("--overlay-src", "/usr/share", "--overlay", f"{d}/_ol_upper", f"{d}/._ol_work", "/a")
+    assert (d / "_ol_upper").is_dir()
+
+
+def test_overlay_auto_needs_single_lower(bb):
+    bb.profile("p", {"vars": {"olay_root": "/ov"},
+                     "mounts": {"/a": {"overlay": {"lower": ["/l1", "/l2"], "mode": "auto"}}}})
+    bb.fails("-i", "p", TARGET, match="needs exactly one lower dir, got 2")
+
+
+def test_mount_paths_with_braces_are_not_formatted_twice(bb):
+    res = run_profile(bb, {"mounts": {"/a{{b}}": "tmpfs", "/c{{d}}": "bind-try"}, "chmod": {"/a{{b}}": 700}})
+    assert res.bwrap.has("--tmpfs", "/a{b}")
+    assert res.bwrap.has("--bind-try", "/c{d}", "/c{d}")
+    assert res.bwrap.has("--chmod", "700", "/a{b}")
 
 
 @pytest.mark.parametrize("value", ["overlay-tmp-create", "overlay-ro-create"])
@@ -219,7 +242,8 @@ def test_overlay_auto_requires_olay_root(bb):
 
 
 @pytest.mark.parametrize("mount, error", [
-    ({"bogus": 1}, "invalid mount value"),
+    ({"bogus": 1}, "invalid mount (of type <class 'dict'>)"),
+    ("bind-bogus", "invalid mount (of type <class 'str'>)"),
     (5, "invalid mount (of type <class 'int'>)"),
 ])
 def test_invalid_mount(bb, mount, error):

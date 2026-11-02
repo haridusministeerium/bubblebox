@@ -53,7 +53,7 @@ def test_missing_include_without_try(bb):
 
 def test_include_entry_needs_id_or_path(bb):
     bb.profile("top", {"include": [{"try": True}]})
-    bb.fails("-i", "top", TARGET, match="AssertionError")
+    bb.fails("-i", "top", TARGET, match="include entry needs an [id] or [path] key")
 
 
 def test_unknown_key_is_rejected(bb):

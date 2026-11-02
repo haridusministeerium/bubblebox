@@ -1,5 +1,6 @@
 """Process-level behaviour: exec paths, signals, info-fd, singleton, logging."""
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -129,19 +130,23 @@ def test_singleton_requires_id(bb):
     bb.fails("-i", "solo", TARGET, match="singleton=True set, but no [id] attr configured")
 
 
+def ns_inodes(pid: int, *names: str) -> dict:
+    return {f"{n}-namespace": os.stat(f"/proc/{pid}/ns/{n}").st_ino for n in names}
+
+
 def start_singleton(bb, running_sandbox, *args: str, profile: dict | None = None,
-                    namespaces: dict | None = None) -> None:
+                    namespaces: tuple[str, ...] = ("mnt",)) -> None:
     """Launch [solo] via bb, then make its recorded bwrapinfo describe a live sandbox."""
     bb.profile("solo", {"id": "solo", "singleton": True, **(profile or {})})
     bb.run(*args, TARGET)
     Path(recorded_bwrapinfo(bb, "solo")).write_text(
-        json.dumps({"child-pid": running_sandbox[0], **(namespaces or {"mnt-namespace": 1})}))
+        json.dumps({"child-pid": running_sandbox[0], **ns_inodes(running_sandbox[0], *namespaces)}))
 
 
 def test_singleton_enters_running_instance(bb, running_sandbox):
     bwrap_pid, child_pid = running_sandbox
     start_singleton(bb, running_sandbox, "-i", "solo", profile={"chdir": "{home}/w"},
-                    namespaces={"mnt-namespace": 1, "pid-namespace": 2, "net-namespace": 3})
+                    namespaces=("mnt", "pid", "net"))
 
     res = bb.run("-i", "solo", TARGET, "arg")
     assert res.calls("bwrap") == []
@@ -190,6 +195,16 @@ def test_singleton_config_hash_ignores_per_run_values(bb, running_sandbox):
     start_singleton(bb, running_sandbox, "-i", "solo", "-s", "$X=x:{cwd}:{instance_id}")
     res = bb.run("-i", "solo", "-s", "$X=x:{cwd}:{instance_id}", TARGET, cwd=bb.root)
     assert res.calls("nsenter")
+
+
+def test_singleton_ignores_instance_whose_pid_was_reused(bb, running_sandbox):
+    start_singleton(bb, running_sandbox, "-i", "solo")
+    info = Path(recorded_bwrapinfo(bb, "solo"))
+    info.write_text(json.dumps({**json.loads(info.read_text()), "mnt-namespace": 1}))
+    res = bb.run("-i", "solo", TARGET)
+    assert res.calls("nsenter") == []
+    assert "no longer runs in its recorded namespaces" in res.stderr
+    assert recorded_bwrapinfo(bb, "solo") == res.bwrap.info_fd_target
 
 
 def test_singleton_ignores_dead_instance(bb):
