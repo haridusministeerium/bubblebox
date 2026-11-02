@@ -113,6 +113,15 @@ def test_singleton_id_from_last_cli_profile_with_id(bb):
     assert not instance_file(bb, "a").exists()
 
 
+def test_singleton_id_inherited_via_include_does_not_claim_instance(bb):
+    bb.profile("base", {"id": "base"})
+    bb.profile("solo", {"id": "solo", "singleton": True})
+    bb.profile("anon", {"include": ["base"]})
+    bb.run("-i", "solo,anon", TARGET)
+    assert instance_file(bb, "solo").is_file()
+    assert not instance_file(bb, "base").exists()
+
+
 def test_singleton_requires_id(bb):
     bb.fails("-j", '{"singleton": true}', TARGET, match="singleton=True set, but no [id] attr configured")
     # the profile's file name is only a lookup key; it does not set [id]

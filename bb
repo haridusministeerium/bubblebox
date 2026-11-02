@@ -796,9 +796,10 @@ DEFAULT_VARS: dict[str, str] = {
 
 SB: dict = get_sandbox(merge_sandboxes(CONFIGS, SafeDict(**os.environ, **DEFAULT_VARS)))
 # [id] keys the singleton instance, so a profile picked via -i owns it even when a later
-# source (e.g. `-s @include=base`, a global `matches` profile) also sets an [id]:
+# source (e.g. `-s @include=base`, a global `matches` profile) also sets an [id].
+# Only an [id] set by the profile itself counts, not one inherited through its includes:
 for sb in reversed(CLI_ID_CONFIGS):
-    if id := merge_sandboxes([sb], SafeDict()).get("id"):
+    if id := sb.get("id"):
         SB["id"] = id
         break
 debug_object("sandbox", SB)
