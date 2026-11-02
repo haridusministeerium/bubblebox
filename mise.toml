@@ -1,0 +1,16 @@
+# The rule to remember: any mise.toml with create = true needs a pinned [tools] python, or the loop comes back in that directory.
+[tools]
+# Pin a Python here whenever a venv has `create = true` below. Then mise
+# passes this interpreter's real path to `uv venv --python ...`, and uv
+# doesn't search PATH, where it would find the mise python shim and loop
+# (shim -> mise -> `uv venv` -> shim ...).
+python = "3.14"
+
+[env]
+#_.python.venv = { path = ".venv", create = true, python = "3.10" } # use a specific python version
+#_.python.venv = { path = ".venv", create = true }
+_.python.venv = { path = ".venv", create = true, uv_create_args = ['--seed'] }
+
+# Use the project name derived from the current directory
+PROJECT_NAME = "{{ config_root | basename }}"
+
