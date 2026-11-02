@@ -1,6 +1,9 @@
 """Process-level behaviour: exec paths, signals, info-fd, singleton, logging."""
+import base64
 import json
 import os
+import platform
+import struct
 import subprocess
 import time
 from pathlib import Path
@@ -56,9 +59,10 @@ def recorded_bwrapinfo(bb, id: str) -> str:
 
 
 @pytest.fixture
-def running_sandbox():
-    """A process with a child, standing in for bwrap and the sandboxed process it spawned."""
-    proc = subprocess.Popen(["sh", "-c", "sleep 60 & wait"])
+def running_sandbox(bb):
+    """A process with a child, standing in for bwrap and the sandboxed process it spawned.
+    Runs in our own namespaces, so entering it joins none; its env is what entering copies."""
+    proc = subprocess.Popen(["sh", "-c", "sleep 60 & wait"], env={**bb.env, "FROM_INSTANCE": "yes"})
     parent = psutil.Process(proc.pid)
     deadline = time.monotonic() + 5
     while not parent.children() and time.monotonic() < deadline:
@@ -143,18 +147,54 @@ def start_singleton(bb, running_sandbox, *args: str, profile: dict | None = None
         json.dumps({"child-pid": running_sandbox[0], **ns_inodes(running_sandbox[0], *namespaces)}))
 
 
+def own_seccomp_filters() -> str:
+    """Filters already on the test process (e.g. from an outer sandbox) are inherited by bb's children."""
+    return next(l.split()[1] for l in Path("/proc/self/status").read_text().splitlines() if l.startswith("Seccomp_filters:"))
+
+
 def test_singleton_enters_running_instance(bb, running_sandbox):
-    bwrap_pid, child_pid = running_sandbox
+    (bb.home / "w").mkdir()
     start_singleton(bb, running_sandbox, "-i", "solo", profile={"chdir": "{home}/w"},
                     namespaces=("mnt", "pid", "net"))
 
-    res = bb.run("-i", "solo", TARGET, "arg")
+    res = bb.run("-i", "solo", TARGET, "arg", env={"FROM_INSTANCE": "no"})
     assert res.calls("bwrap") == []
-    call = res.only("nsenter")
-    assert call["argv"] == ["--preserve-credentials", "--user", "--keep-caps", "--env",
-                            "--target", str(child_pid), "--mount", "--pid", "--net",
-                            f"--wdns={bb.home}/w", "--", TARGET, "arg"]
+    call = res.only(TARGET)
+    assert call["argv"] == ["arg"]
+    assert call["cwd"] == f"{bb.home}/w"
+    assert call["env"]["FROM_INSTANCE"] == "yes"  # env is the instance's, not the launching shell's
+    assert call["status"] == {"CapEff": "0000000000000000", "NoNewPrivs": "1", "Seccomp_filters": own_seccomp_filters()}
+    assert not call["own_session"]
     assert int(call["sigign"], 16) & SIGPIPE_SIGXFSZ == 0
+
+
+def test_singleton_entry_defaults_to_launch_cwd(bb, running_sandbox):
+    start_singleton(bb, running_sandbox, "-i", "solo")
+    assert bb.run("-i", "solo", TARGET).only(TARGET)["cwd"] == str(bb.cwd)
+
+
+def test_singleton_entry_applies_seccomp_and_new_session(bb, running_sandbox):
+    allow_all = struct.pack("HBBI", 0x06, 0, 0, 0x7fff0000)  # BPF_RET|BPF_K SECCOMP_RET_ALLOW
+    seccomp = {"arch": platform.machine(), "data": base64.b64encode(allow_all).decode()}
+    start_singleton(bb, running_sandbox, "-i", "solo", profile={"seccomp": seccomp, "newSession": True})
+    call = bb.run("-i", "solo", TARGET).only(TARGET)
+    assert call["status"]["Seccomp_filters"] == str(int(own_seccomp_filters()) + 1)
+    assert call["status"]["NoNewPrivs"] == "1"
+    assert call["own_session"]
+
+
+@pytest.mark.parametrize("profile", [{"capAdd": ["CAP_NET_RAW"]}, {"seccomp": 5}, {"addSeccompFd": [5]}])
+def test_singleton_entry_rejects_unsupported_options(bb, running_sandbox, profile):
+    start_singleton(bb, running_sandbox, "-i", "solo", profile=profile)
+    res = bb.fails("-i", "solo", TARGET, match="entering a running singleton supports neither")
+    assert res.calls(TARGET) == []
+
+
+def test_singleton_entry_propagates_exit_status(bb, running_sandbox):
+    start_singleton(bb, running_sandbox, "-i", "solo")
+    (bb.fakebin / "fail7").write_text("#!/bin/sh\nexit 7\n")
+    (bb.fakebin / "fail7").chmod(0o755)
+    assert bb.run("-i", "solo", "fail7", check=False).returncode == 7
 
 
 def test_singleton_refuses_instance_file_without_config_hash(bb, running_sandbox):
@@ -171,7 +211,7 @@ def test_singleton_enters_instance_started_with_same_config(bb, running_sandbox,
     start_singleton(bb, running_sandbox, *args)
     res = bb.run(*args, TARGET)
     assert res.calls("bwrap") == []
-    assert res.only("nsenter")["argv"][-1] == TARGET
+    assert res.only(TARGET)["argv"] == []
 
 
 @pytest.mark.parametrize("args", [
@@ -182,7 +222,7 @@ def test_singleton_enters_instance_started_with_same_config(bb, running_sandbox,
 def test_singleton_refuses_instance_started_with_other_config(bb, running_sandbox, args):
     start_singleton(bb, running_sandbox, "-i", "solo")
     res = bb.fails(*args, TARGET, match="running [solo] singleton instance was started with a different config")
-    assert res.calls("nsenter") == res.calls("bwrap") == []
+    assert res.calls(TARGET) == res.calls("bwrap") == []
 
 
 def test_singleton_refuses_instance_after_profile_edit(bb, running_sandbox):
@@ -194,7 +234,7 @@ def test_singleton_refuses_instance_after_profile_edit(bb, running_sandbox):
 def test_singleton_config_hash_ignores_per_run_values(bb, running_sandbox):
     start_singleton(bb, running_sandbox, "-i", "solo", "-s", "$X=x:{cwd}:{instance_id}")
     res = bb.run("-i", "solo", "-s", "$X=x:{cwd}:{instance_id}", TARGET, cwd=bb.root)
-    assert res.calls("nsenter")
+    assert res.calls(TARGET)
 
 
 def test_singleton_ignores_instance_whose_pid_was_reused(bb, running_sandbox):
@@ -202,7 +242,7 @@ def test_singleton_ignores_instance_whose_pid_was_reused(bb, running_sandbox):
     info = Path(recorded_bwrapinfo(bb, "solo"))
     info.write_text(json.dumps({**json.loads(info.read_text()), "mnt-namespace": 1}))
     res = bb.run("-i", "solo", TARGET)
-    assert res.calls("nsenter") == []
+    assert res.calls(TARGET) == []
     assert "no longer runs in its recorded namespaces" in res.stderr
     assert recorded_bwrapinfo(bb, "solo") == res.bwrap.info_fd_target
 
@@ -217,7 +257,7 @@ def test_singleton_ignores_dead_instance(bb):
     bb.profile("solo", {"id": "solo", "singleton": True})
 
     res = bb.run("-i", "solo", TARGET)
-    assert res.calls("nsenter") == []
+    assert res.calls(TARGET) == []
     assert recorded_bwrapinfo(bb, "solo") == res.bwrap.info_fd_target
 
 
@@ -245,5 +285,5 @@ def test_singleton_ignores_unparsable_bwrapinfo(bb):
 
     res = bb.run("-i", "solo", TARGET)
     assert f"ignoring unparsable bwrap info file [{info}] of a previous [solo] instance" in res.stderr
-    assert res.calls("nsenter") == []
+    assert res.calls(TARGET) == []
     assert recorded_bwrapinfo(bb, "solo") == res.bwrap.info_fd_target

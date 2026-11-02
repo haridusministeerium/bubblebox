@@ -4,6 +4,7 @@
 
 import argparse
 import base64
+import ctypes
 import hashlib
 import json
 import logging
@@ -79,15 +80,24 @@ SB_CONFIG: Path = XDG_CONFIG / "bubblebox"
 
 SANDBOXES_CACHE: dict[str, dict] = {}
 
-# bwrap info-fd namespace key -> (/proc/<pid>/ns/ entry, nsenter flag)
-NAMESPACES: dict[str, tuple[str, str]] = {
-    "mnt-namespace": ("mnt", "--mount"),
-    "pid-namespace": ("pid", "--pid"),
-    "net-namespace": ("net", "--net"),
-    "ipc-namespace": ("ipc", "--ipc"),
-    "uts-namespace": ("uts", "--uts"),
-    "cgroup-namespace": ("cgroup", "--cgroup"),
+# bwrap info-fd namespace key -> (/proc/<pid>/ns/ entry, setns() flag)
+NAMESPACES: dict[str, tuple[str, int]] = {
+    "mnt-namespace": ("mnt", os.CLONE_NEWNS),
+    "pid-namespace": ("pid", os.CLONE_NEWPID),
+    "net-namespace": ("net", os.CLONE_NEWNET),
+    "ipc-namespace": ("ipc", os.CLONE_NEWIPC),
+    "uts-namespace": ("uts", os.CLONE_NEWUTS),
+    "cgroup-namespace": ("cgroup", os.CLONE_NEWCGROUP),
 }
+
+# from linux/prctl.h & linux/seccomp.h & linux/capability.h
+PR_SET_PDEATHSIG: int = 1
+PR_SET_SECCOMP: int = 22
+PR_CAPBSET_DROP: int = 24
+PR_SET_NO_NEW_PRIVS: int = 38
+SECCOMP_MODE_FILTER: int = 2
+LINUX_CAPABILITY_VERSION_3: int = 0x20080522
+LIBC = ctypes.CDLL(None, use_errno=True)
 
 
 BWRAP_FLAGS: set[str] = {"levelPrefix", "unshareAll", "shareNet", "unshareUser",
@@ -151,9 +161,22 @@ def restore_default_signals() -> None:
         signal.signal(sig, signal.SIG_DFL)
 
 
-def exec(file: str, *args) -> NoReturn:
+def exec(file: str, *args, env: dict[str, str]|None=None) -> NoReturn:
     restore_default_signals()
-    os.execlp(file, *args)
+    if env is None:
+        os.execlp(file, *args)
+    os.execvpe(file, args, env)
+
+
+# picks the seccomp program for our arch from a {data: base64, arch: string} or list thereof
+def get_seccomp_program(value: dict|list) -> bytes:
+    data: list[bytes] = [base64.b64decode(prog["data"]) for prog in ([value] if isinstance(value, dict) else value)
+                         if prog["arch"] == platform.machine()]
+    if len(data) == 0:
+        raise Exception(f"seccomp program not found for our architecture: {platform.machine()}")
+    elif len(data) != 1:
+        raise Exception(f"{len(data)} seccomp programs found for our architecture {platform.machine()}, expected 1")
+    return data[0]
 
 
 # TODO: should we also do os.path.expandvars() ?
@@ -443,18 +466,9 @@ def get_bwrap_args(sb: dict) -> list[str]:
     # TODO: the input 'value' type can never be list, only dict or int, no?
     #       edit: think it can be list with 'seccomp' after all
     def format_seccomp_value(value: dict|list|int) -> str:
-        if isinstance(value, dict):  # {data: string, arch: string}
-            value = [value]
-
-        if isinstance(value, list):  # {data: string, arch: string}[]
-            data: list[bytes] = [base64.b64decode(prog["data"]) for prog in value if prog["arch"] == platform.machine()]
-            if len(data) == 0:
-                raise Exception(f"seccomp program not found for our architecture: {platform.machine()}")
-            elif len(data) != 1:
-                raise Exception(f"{len(data)} seccomp programs found for our architecture {platform.machine()}, expected 1")
-            return pipefd(data[0])
-        else:  # fd
-            return str(value)
+        if isinstance(value, (dict, list)):
+            return pipefd(get_seccomp_program(value))
+        return str(value)  # fd
 
     # TODO: what are the possible 'value' types? is it dict|list|int|str?
     def format_option_value(opt_name: str, value) -> str:
@@ -707,20 +721,122 @@ def get_running_instance_bwrapinfo(singleton_location: str, sb_id: str) -> dict|
         return info
 
 
-# TODO: lacking seccomp filters; consider re-adding, or migrating to gvisor?
-#       alternatively consider https://gist.github.com/sloonz/4b7f5f575a96b6fe338534dbc2480a5d?permalink_comment_id=5926910#file-sandbox-py-L135-L142
+def prctl(option: int, *args: int) -> None:
+    if LIBC.prctl(ctypes.c_int(option), *(ctypes.c_ulong(a) for a in (*args, 0, 0, 0, 0)[:4])) != 0:
+        err: int = ctypes.get_errno()
+        raise OSError(err, f"prctl({option}): {os.strerror(err)}")
+
+
+class SockFprog(ctypes.Structure):  # struct sock_fprog
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+
+def load_seccomp(program: bytes) -> None:
+    if len(program) % 8:  # array of 8-byte struct sock_filter
+        raise Exception(f"seccomp program size {len(program)} is not a multiple of 8")
+    buf = ctypes.create_string_buffer(program, len(program))
+    fprog = SockFprog(len(program) // 8, ctypes.addressof(buf))
+    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.addressof(fprog))
+
+
+# like bwrap does for its child: empty the bounding set, so even a uid 0 can't regain
+# capabilities on exec, then clear effective/permitted/inheritable (& thus ambient) sets
+def drop_capabilities(cap_last: int) -> None:
+    try:
+        for cap in range(cap_last + 1):
+            prctl(PR_CAPBSET_DROP, cap)
+    except PermissionError:  # lacking CAP_SETPCAP, i.e. we hold no caps to begin with
+        if os.geteuid() == 0:
+            raise
+    header = (ctypes.c_uint32 * 2)(LINUX_CAPABILITY_VERSION_3, 0)
+    data = (ctypes.c_uint32 * 6)()  # 2x struct __user_cap_data_struct, all zeroes
+    if LIBC.capset(header, data) != 0:
+        err: int = ctypes.get_errno()
+        raise OSError(err, f"capset: {os.strerror(err)}")
+
+
+# Runs [cmd] inside a running singleton's namespaces, applying what bwrap would apply to
+# its own child: no capabilities, no_new_privs, the seccomp program, newSession & dieWithParent.
+#
+# Done in-process rather than via `nsenter`, as nsenter can't apply seccomp, and its
+# --keep-caps would leave [cmd] with the full capability set that joining a user ns grants
+# (bwrap's own child runs with none).
+#
+# Some options can't be reproduced here, so they're rejected rather than silently skipped,
+# which would run [cmd] less confined than the instance's own processes:
+# - fd-based [seccomp] & [addSeccompFd]: these name fds the user handed to the launch that
+#   started the instance; bwrap read & consumed them then, so there's no program to load now;
+# - [capAdd]: keeping select caps across exec for a non-root uid needs ambient caps & a
+#   cap-name-to-number table, i.e. reimplementing bwrap's cap handling; dropping
+#   everything instead would break whatever needed those caps.
 def enter_existing_ns(bwrap_info: dict, sb: dict, cmd: list[str]) -> NoReturn:
-    child: psutil.Process = next(c for c in bwrap_info["bwrap_proc"].children())  # first child running _in_ the sandbox namespace
-    nsent_args: list[str] = ["nsenter", "--preserve-credentials", "--user",
-                             "--keep-caps", "--env", "--target", str(child.pid)]
-    nsent_args += (flag for k, (_, flag) in NAMESPACES.items() if k in bwrap_info)
+    if sb.get("capAdd") or sb.get("addSeccompFd") or isinstance(sb.get("seccomp"), int):
+        raise Exception("entering a running singleton supports neither [capAdd], [addSeccompFd] nor fd-based [seccomp]")
+    seccomp: bytes|None = get_seccomp_program(sb["seccomp"]) if sb.get("seccomp") else None
+
+    target: psutil.Process|None = next(iter(bwrap_info["bwrap_proc"].children()), None)  # first child running _in_ the sandbox
+    if target is None:
+        raise Exception("running singleton instance has no sandboxed process to enter")
+    pidfd: int = os.pidfd_open(target.pid)  # pins the process, so the checks below can't race a pid reuse
+    with open(f"/proc/{target.pid}/environ", "rb") as f:
+        env: dict[str, str] = dict(os.fsdecode(e).split("=", 1) for e in f.read().split(b"\0") if b"=" in e)
+    flags: int = 0
+    for key, (name, flag) in (("user-namespace", ("user", os.CLONE_NEWUSER)), *NAMESPACES.items()):
+        if key != "user-namespace" and key not in bwrap_info:
+            continue
+        ino: int = os.stat(f"/proc/{target.pid}/ns/{name}").st_ino
+        if key in bwrap_info and ino != bwrap_info[key]:
+            raise Exception(f"pid {target.pid} is not in the singleton's recorded {name} namespace")
+        if ino != os.stat(f"/proc/self/ns/{name}").st_ino:  # (re)joining one's own user ns is EINVAL
+            flags |= flag
+    signal.pidfd_send_signal(pidfd, 0)  # raises if it exited, i.e. the /proc reads above may be of another process
+    cap_last: int = int(Path("/proc/sys/kernel/cap_last_cap").read_text())
+    host_cwd: str = os.getcwd()
+
+    # Join all namespaces in one setns(pidfd, flags) call, not one by one: bwrap may nest
+    # the sandboxed process' user ns one level below the user ns that owns the sandbox's
+    # mount & pid namespaces (seen e.g. when the profile mounts /dev). Joining that lower user
+    # ns grants caps only within it, not in its parent that owns the mount ns, so a
+    # subsequent setns(mnt) fails with EPERM. The pidfd variant validates the whole set
+    # at once, the same way recent nsenter does it.
+    if flags:
+        os.setns(pidfd, flags)
+    os.close(pidfd)
 
     if wd := sb.get("chdir"):
-        nsent_args.append("--wdns=" + expand(wd, sb["format_vars"]))
+        os.chdir(expand(wd, sb["format_vars"]))
+    else:  # same fallbacks as bwrap: the original cwd, then $HOME, then /
+        for d in (host_cwd, env.get("HOME"), "/"):
+            try:
+                os.chdir(d)
+                break
+            except (OSError, TypeError):
+                pass
 
-    nsent_args += ("--", *cmd)
-    LOGGER.debug("nsenter command: %s\n", shlex.join(nsent_args))
-    exec(nsent_args[0], *nsent_args)
+    LOGGER.debug("entering pid %s namespaces (flags %#x) to run: %s", target.pid, flags, shlex.join(cmd))
+    if (child := os.fork()) == 0:  # joining a pid ns only applies to children
+        try:
+            if sb.get("newSession") is True:
+                os.setsid()
+            if sb.get("dieWithParent") is True:
+                prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+            drop_capabilities(cap_last)
+            prctl(PR_SET_NO_NEW_PRIVS, 1)
+            if seccomp is not None:
+                load_seccomp(seccomp)  # last, as the filter may forbid the syscalls above
+            exec(cmd[0], *cmd, env=env)
+        except BaseException as e:
+            print(f"failed to run [{cmd[0]}] in the singleton sandbox: {e}", file=sys.stderr)
+            os._exit(127)
+
+    for sig in (signal.SIGINT, signal.SIGQUIT):  # leave terminal signals to the child, like a shell does
+        signal.signal(sig, signal.SIG_IGN)
+    code: int = os.waitstatus_to_exitcode(os.waitpid(child, 0)[1])
+    if code < 0:  # killed by a signal: die the same way
+        signal.signal(-code, signal.SIG_DFL)
+        os.kill(os.getpid(), -code)
+        code = 128 - code
+    sys.exit(code)
 
 
 def parse_args() -> tuple[argparse.Namespace, list[tuple[str, str]]]:
@@ -854,7 +970,7 @@ def main() -> NoReturn:
     singleton: bool = sb.get("singleton") is True
     bwrap_infof: str = f"{XDG_RUNTIME}/.flatpak/{instance_id}/bwrapinfo.json"
     singleton_location: str = f"{XDG_RUNTIME}/bubblebox/{sb.get("id")}.instance.info"  # file containing bwrap_infof path for this profile's running instance
-    # nsenter can't apply config, so refuse to enter an instance started from a different one.
+    # entering existing namespace(s) can't apply config, so refuse to enter an instance started from a different one.
     # Hashed before vars/env expansion, which differs per run (instance_id, cwd, host env).
     config_hash: str = hashlib.sha256(json.dumps(merge_sandboxes(configs, SafeDict()), sort_keys=True,
                                                  default=str).encode()).hexdigest() if singleton else ""

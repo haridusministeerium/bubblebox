@@ -2,7 +2,7 @@
 
 `bb` does all its work at module level and ends by exec()ing bwrap, so it is
 tested as a black box: each test runs it as a subprocess against an isolated
-HOME/XDG tree, with fake bwrap/xdg-dbus-proxy/nsenter executables first on
+HOME/XDG tree, with fake bwrap/xdg-dbus-proxy executables first on
 PATH (see fakes/recorder.py). Tests then assert on the recorded invocations.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ FIXTURES = TESTS / "fixtures"
 
 TARGET = "sbx-target"  # fake executable to "sandbox"
 UNSANDBOXED = "sbx-unsandboxed"  # fake executable matched by disableSandbox profiles
-FAKE_EXECUTABLES = ("bwrap", "xdg-dbus-proxy", "nsenter", TARGET, UNSANDBOXED)
+FAKE_EXECUTABLES = ("bwrap", "xdg-dbus-proxy", TARGET, UNSANDBOXED)
 
 SIGPIPE_SIGXFSZ = (1 << (signal.SIGPIPE - 1)) | (1 << (signal.SIGXFSZ - 1))
 

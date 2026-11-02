@@ -1,4 +1,4 @@
-"""Stand-in for bwrap / xdg-dbus-proxy / nsenter / sandboxed executables.
+"""Stand-in for bwrap / xdg-dbus-proxy / sandboxed executables.
 
 Invoked as `recorder.py <name> <args...>` by the wrappers that conftest.py
 puts first on PATH. Instead of doing anything, it appends a JSON record of
@@ -67,7 +67,10 @@ def main() -> None:
     elif name == "xdg-dbus-proxy":
         fake_dbus_proxy(argv)
     else:
-        record(name, {"argv": argv, "cwd": os.getcwd()})
+        status = dict(line.split(":\t", 1) for line in Path("/proc/self/status").read_text().splitlines())
+        record(name, {"argv": argv, "cwd": os.getcwd(), "env": dict(os.environ),
+                      "own_session": os.getsid(0) == os.getpid(),
+                      "status": {k: status[k].strip() for k in ("CapEff", "NoNewPrivs", "Seccomp_filters")}})
 
 
 if __name__ == "__main__":
