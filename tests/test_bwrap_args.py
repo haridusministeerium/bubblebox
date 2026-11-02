@@ -2,7 +2,6 @@
 import base64
 import os
 import platform
-import pwd
 
 import pytest
 
@@ -197,7 +196,7 @@ def test_overlay_auto(bb):
         "/c": "overlay-auto:/usr/share",
         "/d": "overlay-auto:/home/other/x",
     }})
-    me = f"home-{pwd.getpwuid(os.getuid()).pw_name}"
+    me = f"home-{os.getuid()}"
     a, b, c, d = root / me / "a", root / me / "lower", root / "root/usr/share", root / "home-other/x"
     assert res.bwrap.has("--overlay-src", f"{bb.home}/a",
                          "--overlay", f"{a}/_ol_upper", f"{a}/._ol_work", f"{bb.home}/a")
