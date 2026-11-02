@@ -1,6 +1,8 @@
 """Which profiles get loaded: lookup paths, CLI sources, matches, autoload, default."""
 import json
 
+import pytest
+
 from conftest import TARGET
 
 
@@ -101,6 +103,15 @@ def test_set_parses_json_values(bb):
 def test_set_array_marker(bb):
     res = bb.run("-s", "@extraArgs=--from-set", TARGET)
     assert res.bwrap.has("--from-set")
+
+
+@pytest.mark.parametrize("arg", ["@include= a,, b ", "include=a,b"])
+def test_set_include_comma_separated(bb, arg):
+    bb.profile("a", {"hostname": "a", "extraArgs": ["--a"]})
+    bb.profile("b", {"hostname": "b", "extraArgs": ["--b"]})
+    res = bb.run("-s", arg, TARGET)
+    assert res.bwrap.has("--a", "--b")
+    assert hostname(res) == "b"
 
 
 # --- implicit selection -----------------------------------------------------

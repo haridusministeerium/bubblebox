@@ -735,6 +735,8 @@ for source_type, source_data in CONFIGS_SOURCES:
             k, v = source_data.split("=", 1)
             k = re.sub(r"^\$", "env.", re.sub(r"^:", "vars.", k))
             v = json.loads(v) if v and (v[0] in '"[{' or v in ("true", "false", "null")) else v
+            if k in ("include", "@include") and isinstance(v, str):
+                k, v = "include", [i for i in (i.strip() for i in v.split(",")) if i]
             obj = {}
             cur = obj
             for is_array, p, end in re.findall(r'(?:^|\.)(@?)("[^"=]+"|[^".=]+)(=$)?', f"{k}="):
