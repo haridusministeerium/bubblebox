@@ -20,6 +20,7 @@ import shlex
 import sys
 import yaml
 import psutil
+import pwd
 import signal
 
 
@@ -185,13 +186,14 @@ def expand(var: str, fmt: dict) -> str:
 
 
 # maps an overlay's lower dir to its relative location under [olay_root]:
-# $HOME/x -> ~/x; /home/x -> home/x; /x -> root/x
+# $HOME/x -> home-<our user>/x; /home/<user>/x -> home-<user>/x; /x -> root/x
 def overlay_dir_key(path: str) -> str:
     path = os.path.normpath(path)
     if path == HOME or path.startswith(HOME + "/"):
-        return "~" + path.removeprefix(HOME)
-    if path == "/home" or path.startswith("/home/"):
-        return path.lstrip("/")
+        return f"home-{pwd.getpwuid(os.getuid()).pw_name}" + path.removeprefix(HOME)
+    if path.startswith("/home/"):
+        user, _, rest = path.removeprefix("/home/").partition("/")
+        return f"home-{user}" + (f"/{rest}" if rest else "")
     return "root" + path.rstrip("/")
 
 

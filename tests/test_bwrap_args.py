@@ -1,6 +1,8 @@
 """Translation of the merged sandbox config into bwrap arguments."""
 import base64
+import os
 import platform
+import pwd
 
 import pytest
 
@@ -195,7 +197,8 @@ def test_overlay_auto(bb):
         "/c": "overlay-auto:/usr/share",
         "/d": "overlay-auto:/home/other/x",
     }})
-    a, b, c, d = root / "~/a", root / "~/lower", root / "root/usr/share", root / "home/other/x"
+    me = f"home-{pwd.getpwuid(os.getuid()).pw_name}"
+    a, b, c, d = root / me / "a", root / me / "lower", root / "root/usr/share", root / "home-other/x"
     assert res.bwrap.has("--overlay-src", f"{bb.home}/a",
                          "--overlay", f"{a}/_ol_upper", f"{a}/._ol_work", f"{bb.home}/a")
     assert res.bwrap.has("--overlay-src", f"{bb.home}/lower",
